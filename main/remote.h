@@ -8,12 +8,15 @@
  *   POST /api/timer?min=N   定时 N 分钟后关断（1~999），N = 0 取消定时
  *   POST /api/stop          立即停止输出
  *
- * 线程模型：HTTP 处理在 httpd 任务中运行，只把命令放进队列并等待结果；
- * 命令由主循环通过 remote_poll() 取出、执行后 remote_reply() 回复。
- * 状态由主循环通过 remote_publish() 定期写入快照，HTTP 只读快照。
+ * 蓝牙 BLE（可选，见 ble_link.h）：与热点同名广播，命令同样进入本模块的命令队列。
+ * 蓝牙连接时关闭热点，断开后恢复；有手机连在热点上时停止蓝牙广播。
  *
- * 安全：只有 Wi-Fi WPA2 密码一层保护，HTTP 本身没有认证；
- * 连上热点的任何人都能控制红外输出，请修改默认密码。
+ * 线程模型：HTTP 处理在 httpd 任务、蓝牙在 NimBLE 任务中运行，只把命令放进队列；
+ * 命令由主循环通过 remote_poll() 取出、执行后 remote_reply() 回复（HTTP 等待结果，
+ * 蓝牙结果随下一次状态通知带回）。状态由主循环通过 remote_publish() 定期写入。
+ *
+ * 安全：热点只有 WPA2 密码一层保护，HTTP 本身没有认证；蓝牙未加密。
+ * 能连上的任何人都能控制红外输出。
  */
 #pragma once
 
@@ -27,12 +30,24 @@ typedef enum {
     REMOTE_CMD_STOP,
 } remote_cmd_kind_t;
 
+typedef enum {
+    REMOTE_SRC_HTTP,
+    REMOTE_SRC_BLE,
+} remote_src_t;
+
 typedef struct {
     remote_cmd_kind_t kind;
     uint16_t permille;
     uint16_t minutes;
     uint32_t seq;
+    remote_src_t source;
 } remote_cmd_t;
+
+typedef enum {
+    REMOTE_LINK_NONE,
+    REMOTE_LINK_WIFI,       // 有手机连在热点上
+    REMOTE_LINK_BLE,        // 有手机通过蓝牙连接（此时热点关闭）
+} remote_link_t;
 
 typedef enum {
     REMOTE_OK = 0,
@@ -63,6 +78,13 @@ esp_err_t remote_start_delayed(uint32_t delay_ms);
 
 bool remote_is_running(void);
 bool remote_is_starting(void);
+bool remote_wifi_on(void);          // 热点当前是否开启（蓝牙连接时关闭）
+bool remote_ble_running(void);
+const char *remote_ble_name(void);
+remote_link_t remote_link(void);
+
+// 蓝牙命令入口（由 ble_link 在 NimBLE 任务中调用）：op 1 占空比 / 2 定时 / 3 停止
+void remote_ble_command(uint8_t op, uint8_t seq, uint16_t value);
 const char *remote_ssid(void);
 const char *remote_password(void);
 int remote_client_count(void);

@@ -16,8 +16,14 @@
 #include "esp_wifi.h"
 #include "sdkconfig.h"
 #include "dns_server.h"
+#include "ble_link.h"
 
 #define CMD_TIMEOUT_MS      1000    // 主循环 5 ms 一轮，正常几毫秒内就会回复
+#define BLE_NOTIFY_MS       500
+#define BLE_RESULT_BAD_ARG  4
+#define LINK_PERIOD_MS      200
+#define WIFI_RESUME_MS      3000    // 蓝牙断开后延时恢复热点，避免短暂断连反复开关射频
+#define BLE_START_GAP_MS    2000    // Wi-Fi 启动后再启动蓝牙，错开两次射频初始化的电流峰值
 
 typedef struct {
     uint32_t seq;
@@ -36,6 +42,12 @@ static volatile int s_clients;
 static QueueHandle_t s_cmd_q, s_reply_q;
 static uint32_t s_seq;
 static remote_status_t s_status;
+static esp_netif_t *s_netif;
+static volatile bool s_wifi_on;
+static char s_ble_name[24];
+static volatile uint8_t s_ble_seq, s_ble_result;
+static volatile bool s_ble_dirty;
+static TickType_t s_ble_t_notify;
 static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* ---------- 主循环侧 ---------- */
@@ -72,15 +84,115 @@ bool remote_poll(remote_cmd_t *cmd)
 
 void remote_reply(const remote_cmd_t *cmd, remote_result_t result)
 {
+    if (cmd->source == REMOTE_SRC_BLE) {
+        // 结果随下一次状态通知带回
+        s_ble_seq = (uint8_t)cmd->seq;
+        s_ble_result = (uint8_t)result;
+        s_ble_dirty = true;
+        return;
+    }
     const reply_t r = {.seq = cmd->seq, .result = result};
     xQueueSend(s_reply_q, &r, 0);
 }
+
+#ifdef CONFIG_REMOTE_BLE_ENABLE
+// 蓝牙状态包，20 字节小端：
+//   [0] 版本 1  [1] 最近命令 seq  [2] 最近命令结果 remote_result_t（BLE_RESULT_BAD_ARG = 参数错）
+//   [3] 标志位 bit0 vbus_ok bit1 vbus_9v bit2 vbus_sat bit3 temp_valid bit4 warn bit5 protect
+//              bit6 demo bit7 timer_on
+//   [4..5] pwm  [6..7] setpoint  [8..9] limit（千分比）  [10..11] vbus mV
+//   [12..13] 温度 x10（int16）   [14..15] 定时剩余秒（>65535 时饱和）
+//   [16] fault  [17] driver  [18] bit0 在运行页  [19] 保留
+static void pack_status(const remote_status_t *st, uint8_t out[BLE_LINK_STATUS_LEN])
+{
+    int t10 = st->temp_valid ? (int)(st->temp_c * 10 + (st->temp_c >= 0 ? 0.5f : -0.5f)) : 0;
+    uint32_t left = st->timer_left_s > 0xFFFF ? 0xFFFF : st->timer_left_s;
+    memset(out, 0, BLE_LINK_STATUS_LEN);
+    out[0] = 1;
+    out[1] = s_ble_seq;
+    out[2] = s_ble_result;
+    out[3] = (st->vbus_ok << 0) | (st->vbus_9v << 1) | (st->vbus_saturated << 2) | (st->temp_valid << 3) |
+             (st->warn << 4) | (st->protect << 5) | (st->demo << 6) | (st->timer_active << 7);
+#define PUT16(i, v) do { out[i] = (uint8_t)(v); out[(i) + 1] = (uint8_t)((uint16_t)(v) >> 8); } while (0)
+    PUT16(4, st->pwm);
+    PUT16(6, st->setpoint);
+    PUT16(8, st->limit);
+    PUT16(10, st->vbus_mv < 0 ? 0 : st->vbus_mv);
+    PUT16(12, (int16_t)t10);
+    PUT16(14, left);
+#undef PUT16
+    out[16] = st->fault;
+    out[17] = st->driver;
+    out[18] = st->on_run_page ? 1 : 0;
+}
+#endif
 
 void remote_publish(const remote_status_t *st)
 {
     portENTER_CRITICAL(&s_status_lock);
     s_status = *st;
     portEXIT_CRITICAL(&s_status_lock);
+
+#ifdef CONFIG_REMOTE_BLE_ENABLE
+    // 有新命令结果时立即通知，否则每 BLE_NOTIFY_MS 一次（倒计时按秒变化）
+    TickType_t now = xTaskGetTickCount();
+    if (ble_link_connected() && (s_ble_dirty || now - s_ble_t_notify >= pdMS_TO_TICKS(BLE_NOTIFY_MS))) {
+        uint8_t buf[BLE_LINK_STATUS_LEN];
+        pack_status(st, buf);
+        ble_link_publish(buf);
+        s_ble_dirty = false;
+        s_ble_t_notify = now;
+    }
+#endif
+}
+
+void remote_ble_command(uint8_t op, uint8_t seq, uint16_t value)
+{
+    remote_cmd_t cmd = {.source = REMOTE_SRC_BLE, .seq = seq};
+    switch (op) {
+    case 1: cmd.kind = REMOTE_CMD_DUTY;  cmd.permille = value > 1000 ? 1000 : value; break;
+    case 2: cmd.kind = REMOTE_CMD_TIMER; cmd.minutes = value > 999 ? 999 : value;   break;
+    case 3: cmd.kind = REMOTE_CMD_STOP;  break;
+    default:
+        s_ble_seq = seq;
+        s_ble_result = BLE_RESULT_BAD_ARG;
+        s_ble_dirty = true;
+        return;
+    }
+    if (!s_cmd_q || xQueueSend(s_cmd_q, &cmd, 0) != pdTRUE) {
+        s_ble_seq = seq;
+        s_ble_result = REMOTE_ERR_BUSY;
+        s_ble_dirty = true;
+    }
+}
+
+remote_link_t remote_link(void)
+{
+#ifdef CONFIG_REMOTE_BLE_ENABLE
+    if (ble_link_connected()) {
+        return REMOTE_LINK_BLE;
+    }
+#endif
+    return s_clients > 0 ? REMOTE_LINK_WIFI : REMOTE_LINK_NONE;
+}
+
+bool remote_wifi_on(void)
+{
+    return s_wifi_on;
+}
+
+bool remote_ble_running(void)
+{
+#ifdef CONFIG_REMOTE_BLE_ENABLE
+    return ble_link_running();
+#else
+    return false;
+#endif
+}
+
+const char *remote_ble_name(void)
+{
+    return s_ble_name;
 }
 
 /* ---------- HTTP 侧（httpd 任务） ---------- */
@@ -104,6 +216,7 @@ static esp_err_t run_cmd(httpd_req_t *req, remote_cmd_t *cmd)
     };
     reply_t r;
 
+    cmd->source = REMOTE_SRC_HTTP;
     cmd->seq = ++s_seq;
     xQueueReset(s_reply_q);     // 丢弃之前超时请求的迟到回复
     if (xQueueSend(s_cmd_q, cmd, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -307,6 +420,8 @@ static esp_err_t wifi_bring_up(void)
     CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     CHECK(esp_wifi_set_config(WIFI_IF_AP, &wc));
     CHECK(esp_wifi_start());
+    s_wifi_on = true;
+    s_netif = netif;
     // 单位 0.25 dBm；与 CONFIG_ESP_PHY_MAX_WIFI_TX_POWER 一起限制发射峰值电流
     esp_wifi_set_max_tx_power(CONFIG_REMOTE_WIFI_TX_POWER_DBM * 4);
     dhcp_set_portal_uri(netif);
@@ -325,7 +440,39 @@ static esp_err_t wifi_bring_up(void)
     return ESP_OK;
 }
 
-static void start_task(void *arg)
+static void wifi_stop(void)
+{
+    if (!s_wifi_on) {
+        return;
+    }
+    esp_wifi_stop();
+    s_wifi_on = false;
+    s_clients = 0;      // 停止热点时不一定逐个上报断开
+    ESP_LOGI(TAG, "hotspot off (phone on Bluetooth)");
+}
+
+static void wifi_resume(void)
+{
+    if (s_wifi_on || !s_running) {
+        return;
+    }
+    if (esp_wifi_start() != ESP_OK) {
+        ESP_LOGE(TAG, "hotspot restart failed");
+        return;
+    }
+    esp_wifi_set_max_tx_power(CONFIG_REMOTE_WIFI_TX_POWER_DBM * 4);
+    dhcp_set_portal_uri(s_netif);
+    s_wifi_on = true;
+    ESP_LOGI(TAG, "hotspot back on");
+}
+
+/*
+ * 连接管理：
+ *   空闲        热点 + 蓝牙广播都开，两种方式都能连
+ *   蓝牙已连接  关闭热点；断开 WIFI_RESUME_MS 后恢复热点
+ *   有手机在热点上  停止蓝牙广播；手机全部离开后恢复广播
+ */
+static void link_task(void *arg)
 {
     uint32_t delay_ms = (uint32_t)(uintptr_t)arg;
     ESP_LOGI(TAG, "Wi-Fi starts in %lu ms", (unsigned long)delay_ms);
@@ -333,7 +480,39 @@ static void start_task(void *arg)
     if (wifi_bring_up() != ESP_OK) {
         ESP_LOGE(TAG, "Wi-Fi remote not available");
     }
+
+#ifdef CONFIG_REMOTE_BLE_ENABLE
+    vTaskDelay(pdMS_TO_TICKS(BLE_START_GAP_MS));
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_BT);
+    snprintf(s_ble_name, sizeof(s_ble_name), "%s%02X%02X", CONFIG_REMOTE_WIFI_SSID_PREFIX, mac[4], mac[5]);
+    if (ble_link_start(s_ble_name) != ESP_OK) {
+        ESP_LOGE(TAG, "Bluetooth remote not available");
+    }
+#endif
     s_starting = false;
+
+#ifdef CONFIG_REMOTE_BLE_ENABLE
+    TickType_t ble_lost_at = 0;
+    bool was_ble = false;
+    while (ble_link_running()) {
+        bool ble = ble_link_connected();
+        TickType_t now = xTaskGetTickCount();
+        if (ble) {
+            wifi_stop();
+        } else {
+            if (was_ble) {
+                ble_lost_at = now;
+            }
+            if (!s_wifi_on && now - ble_lost_at >= pdMS_TO_TICKS(WIFI_RESUME_MS)) {
+                wifi_resume();
+            }
+            ble_link_set_adv(s_clients == 0);
+        }
+        was_ble = ble;
+        vTaskDelay(pdMS_TO_TICKS(LINK_PERIOD_MS));
+    }
+#endif
     vTaskDelete(NULL);
 }
 
@@ -346,7 +525,7 @@ esp_err_t remote_start_delayed(uint32_t delay_ms)
     }
     // 低优先级后台启动，射频校准期间主循环（按键、保护、界面）照常运行
     s_starting = true;
-    if (xTaskCreate(start_task, "remote_start", 4096, (void *)(uintptr_t)delay_ms, 2, NULL) != pdPASS) {
+    if (xTaskCreate(link_task, "remote_link", 4096, (void *)(uintptr_t)delay_ms, 2, NULL) != pdPASS) {
         s_starting = false;
         return ESP_ERR_NO_MEM;
     }

@@ -1,6 +1,6 @@
 {
   "source": "https://ledfont.botelvdong.com/agent-api.md",
-  "generated_at": "2026-10-14",
+  "generated_at": "2026-10-15",
   "license_note": "Service response contains no font license.",
   "fonts": [
     {
@@ -17,18 +17,18 @@
       "role": "标题栏",
       "font": "wenquanyi_9pt",
       "size": 12,
-      "glyph_count": 225,
-      "byte_count": 4694,
-      "characters": " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~℃一上下不与两中于亮件传位供保停光入关减出分到制功动压取右同后启器回固址增备复大失存定密将小屏左已常幕度开归待态恢感找护按掉接控提故断无时未机束板查档梯检止正步测消温灯状率电界码确示离结网置行解警认设试读调败路软输过运返进配钟锁键闭间阶降限除障零面页项预驱默？"
+      "glyph_count": 231,
+      "byte_count": 4860,
+      "characters": " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~℃一上下不与两中于亮件传位供保停光入关减出分到制功动压取右同后启器回固址增备复大失存定密将小屏左已常幕度开归待态恢感手找护按掉接控提故断无时未机束板查档梯检止正步测消温灯点热牙状率电界码确示离结网置蓝行解警认设试读调败路软输过运返进连配钟锁键闭间阶降限除障零面页项预驱默？"
     },
     {
       "array_name": "ui_font_body",
       "role": "正文/菜单/弹框",
       "font": "wenquanyi_13px",
       "size": 14,
-      "glyph_count": 225,
-      "byte_count": 5397,
-      "characters": " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~℃一上下不与两中于亮件传位供保停光入关减出分到制功动压取右同后启器回固址增备复大失存定密将小屏左已常幕度开归待态恢感找护按掉接控提故断无时未机束板查档梯检止正步测消温灯状率电界码确示离结网置行解警认设试读调败路软输过运返进配钟锁键闭间阶降限除障零面页项预驱默？"
+      "glyph_count": 231,
+      "byte_count": 5581,
+      "characters": " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~℃一上下不与两中于亮件传位供保停光入关减出分到制功动压取右同后启器回固址增备复大失存定密将小屏左已常幕度开归待态恢感手找护按掉接控提故断无时未机束板查档梯检止正步测消温灯点热牙状率电界码确示离结网置蓝行解警认设试读调败路软输过运返进连配钟锁键闭间阶降限除障零面页项预驱默？"
     },
     {
       "array_name": "ui_font_big",

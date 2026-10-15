@@ -135,6 +135,15 @@ menu "850nm LED Controller"
                 降低发射功率可显著降低发射时的峰值电流；10 dBm 在桌面几米内足够。
                 另由 CONFIG_ESP_PHY_MAX_WIFI_TX_POWER 限制射频初始化阶段的最大功率。
 
+        config REMOTE_BLE_ENABLE
+            bool "Also enable Bluetooth LE control"
+            depends on REMOTE_ENABLE && BT_NIMBLE_ENABLED
+            default y
+            help
+                与热点同时广播，广播名与热点 SSID 相同。手机用 Chrome 打开 tools/ble_control.html 连接。
+                蓝牙连接后自动关闭热点，断开 3 s 后恢复；有手机连在热点上时停止蓝牙广播。
+                未加密，附近任何人都能连接并控制红外输出。
+
         config REMOTE_WIFI_MAX_CONN
             int "Max phones"
             depends on REMOTE_ENABLE

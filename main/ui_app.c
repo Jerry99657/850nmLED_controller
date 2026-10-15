@@ -107,6 +107,8 @@ static char s_txt_pwd[65];
 static char s_txt_fault[24];
 static char s_txt_sensor[16];
 static char s_txt_driver[16];
+static char s_txt_ble[24];
+static char s_txt_link[16];
 static char s_txt_uptime[16];
 static char s_txt_fw[32];
 static char s_txt_idf[24];
@@ -114,6 +116,7 @@ static char s_txt_idf[24];
 static ctrl_status_t s_st;
 static ctrl_fault_t s_last_fault = CTRL_FAULT_NONE;
 static bool s_last_9v;
+static remote_link_t s_last_link;
 static const char *s_pending_toast;
 static uint32_t s_info_at;
 static uint32_t s_started_at;
@@ -181,10 +184,15 @@ static void refresh_texts(uint32_t now_ms)
         snprintf(s_txt_sensor, sizeof(s_txt_sensor), "未找到");
     }
     snprintf(s_txt_uptime, sizeof(s_txt_uptime), "%lus", (unsigned long)((now_ms - s_started_at) / 1000));
-    // Wi-Fi 延时启动，热点信息随状态刷新
+    // Wi-Fi / 蓝牙延时启动，蓝牙连接时热点关闭，信息随状态刷新
     snprintf(s_txt_ssid, sizeof(s_txt_ssid), "%s",
-             remote_is_running() ? remote_ssid() : remote_is_starting() ? "启动中" : "未开启");
+             !remote_is_running() ? (remote_is_starting() ? "启动中" : "未开启")
+             : remote_wifi_on() ? remote_ssid() : "已关闭");
     snprintf(s_txt_pwd, sizeof(s_txt_pwd), "%s", remote_is_running() ? remote_password() : "--");
+    snprintf(s_txt_ble, sizeof(s_txt_ble), "%s",
+             remote_ble_running() ? remote_ble_name() : remote_is_starting() ? "启动中" : "未开启");
+    static const char *links[] = {[REMOTE_LINK_NONE] = "未连接", [REMOTE_LINK_WIFI] = "热点", [REMOTE_LINK_BLE] = "蓝牙"};
+    snprintf(s_txt_link, sizeof(s_txt_link), "%s", links[remote_link()]);
 }
 
 /* ---------- 页面定义 ---------- */
@@ -215,6 +223,7 @@ static const KK_UI_InfoRow status_rows[] = {
     {"保护", s_txt_fault},
     {"温度传感器", s_txt_sensor},
     {"LED驱动", s_txt_driver},
+    {"手机连接", s_txt_link},
     {"运行时间", s_txt_uptime},
 };
 
@@ -229,6 +238,7 @@ static const KK_UI_InfoRow about_rows[] = {
     {"两键同按", "确定/返回"},
     {"WiFi", s_txt_ssid},
     {"密码", s_txt_pwd},
+    {"蓝牙", s_txt_ble},
     {"网址", "192.168.4.1"},
     {"设置保存", "掉电保存"},
     {"离开运行页", "输出归零"},
@@ -397,6 +407,15 @@ void ui_app_process_events(void)
     if (s_st.fault != s_last_fault) {
         show_toast(s_st.fault != CTRL_FAULT_NONE ? fault_toast(s_st.fault) : "保护已解除");
         s_last_fault = s_st.fault;
+    } else if (remote_link() != s_last_link) {
+        remote_link_t l = remote_link();
+        if (l == REMOTE_LINK_BLE) {
+            show_toast("蓝牙已连接");    // 宽度上限 120 px，热点关闭见状态页
+        } else if (s_last_link == REMOTE_LINK_BLE) {
+            show_toast("蓝牙断开");
+        }
+        s_last_link = l;
+        KK_UI_Invalidate();
     } else if (control_take_vbus_stop()) {
         show_toast("功率接入 已停止输出");
     } else if (control_take_timer_expired()) {

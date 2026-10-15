@@ -91,7 +91,8 @@ main/
   vbus.c/.h               VBUS ADC 采样（5 V / 9 V 判档）
   lp8556.c/.h             LP8556 LED_EN 配置（只写不读）
   settings.c/.h           设置掉电保存（NVS）
-  remote.c/.h             Wi-Fi 热点 + HTTP 接口 + 强制门户，命令经队列交主循环执行
+  remote.c/.h             Wi-Fi 热点 + HTTP 接口 + 强制门户 + 热点/蓝牙互斥管理，命令经队列交主循环执行
+  ble_link.c/.h           蓝牙 BLE 外设（NimBLE），GATT 命令/状态特征
   web/index.html          手机控制网页（嵌入固件）
   led_pwm.c/.h            GPIO1 LEDC 公共调光（千分比、上限钳位、立即关断）
   tmp102.c/.h             TMP102 温度读取（i2c_master 驱动）
@@ -105,6 +106,7 @@ main/
   board_pins.h            GPIO 分配
   Kconfig.projbuild       menuconfig → "850nm LED Controller"
 tools/gen_ui_fonts.py     重新生成 ui_fonts.c
+tools/ble_control.html    手机蓝牙控制网页（单文件，Android Chrome）
 ```
 
 当前完成阶段 1~5，并加入手机遥控：
@@ -129,6 +131,11 @@ tools/gen_ui_fonts.py     重新生成 ui_fonts.c
   - 停止、故障、离开运行页或定时到时都会同时取消定时。板上按键暂不能设定定时。
   - 上电顺序：先完成屏幕、传感器等小电流外设，Wi-Fi 在后台延时 3 s 启动（上次欠压复位则 9 s），发射功率限制为 10 dBm，欠压复位后自动再降功率，降低 3.3 V DCDC 的瞬态压降。蓝牙未编译进固件。
   - 安全：只有 Wi-Fi 密码一层保护，HTTP 无认证，请在 menuconfig “Wi-Fi remote (phone)” 中修改密码；也可在该菜单关闭遥控。
+
+- 蓝牙控制：与热点同名广播（`850nm-xxxx`）。Android 手机用 Chrome 打开 `tools/ble_control.html`，点“连接板子”选择设备，功能与热点网页相同，手机可同时正常上网。
+  - 蓝牙连上后自动关闭热点，断开 3 s 后恢复；有手机连在热点上时停止蓝牙广播。两者都空闲时同时开启，任一方式都能连上。
+  - 网页蓝牙需要安全上下文：Android 上从文件管理器打开、地址为 `content://` 时不可用，需放到 HTTPS 网址（如 Gitee Pages）；电脑 Chrome 可直接打开本地文件。iPhone Safari 不支持。
+  - 蓝牙未加密，附近任何人都能连接并控制红外输出。可在 menuconfig “Wi-Fi remote (phone)” 关闭。
 
 menuconfig：PWM 频率/软启动/上限、过温阈值、状态灯默认亮度在 "850nm LED Controller"；屏幕参数在 "KK_OLED: ST7735S"。`LED_PWM_DEMO`（阶梯测试）默认关闭，开启后会自动点亮红外阵列。
 
