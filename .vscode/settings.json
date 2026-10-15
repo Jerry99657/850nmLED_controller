@@ -1,0 +1,17 @@
+{
+    "idf.currentSetup": "D:\\esp\\v6.1\\esp-idf",
+    "idf.flashType": "UART",
+    "idf.openOcdConfigs": [
+        "board/esp32c3-builtin.cfg"
+    ],
+    "idf.customExtraVars": {
+        "IDF_TARGET": "esp32c3"
+    },
+    "clangd.path": "D:\\Espressif\\tools\\esp-clangd\\esp-21.1.3_20260408\\esp-clangd\\bin\\clangd.exe",
+    "clangd.arguments": [
+      "--background-index",
+      "--query-driver=**",
+      "--compile-commands-dir=d:\\STM32\\ESP32\\850nmLED_controller\\build"
+    ],
+    "idf.port": "COM7"
+}

@@ -1,0 +1,51 @@
+menu "KK_OLED: ST7735S 0.96\" 80x160 TFT"
+
+    config TFT_SPI_CLOCK_MHZ
+        int "SPI clock (MHz)"
+        range 1 40
+        default 20
+
+    config TFT_ROTATE_180
+        bool "Rotate 180 degrees"
+        default y
+        help
+            横屏方向：关闭时 OLED_SetRotation(90)，打开时 OLED_SetRotation(270)。
+            默认按当前板子的屏幕安装方向打开；画面上下颠倒时切换。
+
+    config TFT_INVERT
+        bool "Invert colors (INVON)"
+        default y
+        help
+            多数 0.96 英寸 IPS 屏需要开启；底色发白、颜色反相时关闭。
+
+    config TFT_BGR
+        bool "BGR color order"
+        default y
+
+    config TFT_COL_OFFSET
+        int "Column offset (portrait)"
+        range 0 60
+        default 26
+        help
+            竖屏方向下可视区第 0 列在控制器 RAM 中的列地址。
+            132x162 RAM 的面板常见 26，128x160 RAM 的面板常见 24。
+
+    config TFT_ROW_OFFSET
+        int "Row offset (portrait)"
+        range 0 60
+        default 1
+        help
+            竖屏方向下可视区第 0 行在控制器 RAM 中的行地址。
+            132x162 RAM 的面板常见 1，128x160 RAM 的面板常见 0。
+
+    config TFT_FG_COLOR
+        hex "Foreground color (RGB565)"
+        range 0x0 0xFFFF
+        default 0xFFFF
+
+    config TFT_BG_COLOR
+        hex "Background color (RGB565)"
+        range 0x0 0xFFFF
+        default 0x0000
+
+endmenu

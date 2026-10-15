@@ -1,0 +1,153 @@
+menu "850nm LED Controller"
+
+    menu "LED_PWM"
+
+        config LED_PWM_FREQ_HZ
+            int "LED_PWM frequency (Hz)"
+            range 1000 5000
+            default 2000
+            help
+                公共 LED_PWM 频率。设计报告建议外部 PWM 1~5 kHz。
+
+        config LED_PWM_SOFTSTART_MS
+            int "Soft-start time 0 -> limit (ms)"
+            range 100 2000
+            default 400
+            help
+                默认软启动时间，可在界面“设置”中修改。设计报告建议 300~500 ms。
+
+        config LED_PWM_DEMO
+            bool "Run PWM step demo at boot"
+            default n
+            help
+                启动后自动循环 5% -> 10% -> 上限 -> 0%，按键调光失效。
+                接功率输入时会自动点亮红外阵列，仅在明确需要时打开。
+
+    endmenu
+
+    menu "VBUS detection"
+
+        config VBUS_DIVIDER_PERMILLE
+            int "Divider ratio ADC/VBUS (x1000)"
+            range 100 1000
+            default 332
+            help
+                ADC0 引脚电压 / VBUS 电压 x 1000。
+
+        config VBUS_9V_THRESHOLD_MV
+            int "9V threshold (VBUS mV)"
+            range 5500 8500
+            default 7000
+            help
+                VBUS 高于 阈值 + 回差 判为 9 V，低于 阈值 - 回差 判为 5 V。
+                默认 7.0 V 对应 ADC 端约 2.32 V，仍在 12 dB 衰减的校准量程内；
+                9 V 时 ADC 端约 3.0 V 会饱和，但不影响判档。
+
+        config VBUS_HYSTERESIS_MV
+            int "Hysteresis (VBUS mV)"
+            range 0 1500
+            default 500
+
+        config LED_PWM_LIMIT_5V_PERCENT
+            int "Max duty at 5V (%)"
+            range 0 100
+            default 50
+            help
+                5 V 输入（含未接功率口、ADC 故障）时的占空比上限。
+
+        config LED_PWM_LIMIT_9V_PERCENT
+            int "Max duty at 9V (%)"
+            range 0 100
+            default 100
+
+        config LP8556_LED_EN
+            hex "LP8556 LED_EN (reg 16h)"
+            range 0x01 0x3F
+            default 0x1F
+            help
+                bit5:0 对应 LED6:1。默认 0x1F：只开 LED1~5，关闭悬空的 LED6。
+                芯片上电默认 0x3F（6 路全开）。每次 VBUS 上电后、PWM 为低时写入。
+
+    endmenu
+
+    menu "Thermal protection"
+
+        config THERMAL_WARN_C
+            int "Warning threshold (C)"
+            range 30 100
+            default 55
+
+        config THERMAL_SHUTDOWN_C
+            int "Shutdown threshold (C)"
+            range 30 120
+            default 70
+            help
+                达到该温度立即关断 LED_PWM 并锁存故障；
+                温度回落到预警阈值以下后解除，亮度设定清零，需重新按键开启。
+
+    endmenu
+
+    menu "Wi-Fi remote (phone)"
+
+        config REMOTE_ENABLE
+            bool "Enable Wi-Fi hotspot + web control"
+            default y
+            help
+                开启后板子作为热点，手机连接后访问 http://192.168.4.1 控制占空比和定时。
+                只有 WPA2 密码一层保护，HTTP 无认证，请修改默认密码。
+
+        config REMOTE_WIFI_SSID_PREFIX
+            string "SSID prefix (MAC suffix appended)"
+            depends on REMOTE_ENABLE
+            default "850nm-"
+            help
+                实际 SSID = 前缀 + MAC 后 4 位十六进制，例如 850nm-23A0。只用 ASCII 字符。
+
+        config REMOTE_WIFI_PASSWORD
+            string "Password (WPA2, 8~63 chars)"
+            depends on REMOTE_ENABLE
+            default "850nm1234"
+            help
+                显示在板子“关于”页。只用 ASCII 字符，至少 8 位。
+
+        config REMOTE_WIFI_CHANNEL
+            int "Channel"
+            depends on REMOTE_ENABLE
+            range 1 13
+            default 6
+
+        config REMOTE_START_DELAY_MS
+            int "Start delay after boot (ms)"
+            depends on REMOTE_ENABLE
+            range 0 30000
+            default 3000
+            help
+                上电后先完成屏幕、传感器等小电流外设，再延时启动 Wi-Fi，
+                避免射频校准和发射的电流尖峰叠加在上电过程中引起欠压复位。
+                上次复位原因为欠压时自动延长为 3 倍。
+
+        config REMOTE_WIFI_TX_POWER_DBM
+            int "Max TX power (dBm)"
+            depends on REMOTE_ENABLE
+            range 2 20
+            default 10
+            help
+                降低发射功率可显著降低发射时的峰值电流；10 dBm 在桌面几米内足够。
+                另由 CONFIG_ESP_PHY_MAX_WIFI_TX_POWER 限制射频初始化阶段的最大功率。
+
+        config REMOTE_WIFI_MAX_CONN
+            int "Max phones"
+            depends on REMOTE_ENABLE
+            range 1 4
+            default 2
+
+    endmenu
+
+    config WS2812_BRIGHTNESS_PERCENT
+        int "WS2812 default brightness (%)"
+        range 5 100
+        default 15
+        help
+            默认状态灯亮度，可在界面“设置”中以 5% 步进修改。
+
+endmenu
