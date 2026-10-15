@@ -51,9 +51,12 @@ menu "850nm LED Controller"
         config LED_PWM_LIMIT_5V_PERCENT
             int "Max duty at 5V (%)"
             range 0 100
-            default 50
+            default 100
             help
                 5 V 输入（含未接功率口、ADC 故障）时的占空比上限。
+                默认 100%：不做降额，5 V 下也允许满占空比。
+                改回 50 可恢复原来的 5 V 限功率（设计报告里的 P1 风险对策，
+                5 V/2 A 电源满占空比可能触发过流保护或欠压复位）。
 
         config LED_PWM_LIMIT_9V_PERCENT
             int "Max duty at 9V (%)"

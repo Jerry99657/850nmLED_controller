@@ -79,9 +79,11 @@ def main():
         BUILD / "res" / "compiled.zip")
 
     # 2. Java → class → dex
+    # 注意：不能把 android.jar 放到 -bootclasspath —— 它是"精简版"平台，缺 java.lang.invoke.LambdaMetafactory，
+    # lambda 会编译不过。用 --release 8（java.* 取 JDK 8 签名）+ classpath 引 android.* 。
     srcs = sorted(str(p) for p in (ROOT / "src").rglob("*.java"))
-    run(JDK / "bin" / "javac.exe", "-encoding", "UTF-8", "-source", "8", "-target", "8",
-        "-Xlint:-options", "-bootclasspath", ANDROID_JAR,
+    run(JDK / "bin" / "javac.exe", "-encoding", "UTF-8", "--release", "8", "-Xlint:none",
+        "-classpath", ANDROID_JAR,
         "-d", BUILD / "classes", *srcs)
     classes = sorted(str(p) for p in (BUILD / "classes").rglob("*.class"))
     run(BT / "d8.bat", "--release", "--min-api", MIN_SDK, "--lib", ANDROID_JAR,

@@ -1,4 +1,6 @@
 build/
+android/out/
+android/keystore/
 sdkconfig.old
 managed_components/
 dependencies.lock
