@@ -17,6 +17,7 @@
 #include "sdkconfig.h"
 #include "dns_server.h"
 #include "ble_link.h"
+#include "control.h"
 
 #define CMD_TIMEOUT_MS      1000    // 主循环 5 ms 一轮，正常几毫秒内就会回复
 #define BLE_NOTIFY_MS       500
@@ -102,7 +103,30 @@ void remote_reply(const remote_cmd_t *cmd, remote_result_t result)
 //              bit6 demo bit7 timer_on
 //   [4..5] pwm  [6..7] setpoint  [8..9] limit（千分比）  [10..11] vbus mV
 //   [12..13] 温度 x10（int16）   [14..15] 定时剩余秒（>65535 时饱和）
-//   [16] fault  [17] driver  [18] bit0 在运行页  [19] 保留
+//   [16] fault  [17] driver
+//   [18] bit0 在运行页，bits1~7 关断阈值的下限（℃）= 板上预警+1，随预警联动。
+//        页面把它右移 1 位当范围下限用，别在页面里写死；更早的固件这一字节只有 0/1
+//        （高位恒 0），页面据此判断读不到下限、退回固定值 61。
+//   [19] 过温关断阈值（℃）
+//
+// 总长必须 ≤ 20 字节：手机不主动协商 MTU 时 ATT MTU 是 23，一条 Notify 只能带
+// MTU-3 = 20 字节，21 字节的包会被协议栈截掉最后一字节（Read 的上限是 MTU-1 = 22，
+// 所以连接时那一次 Read 反而看不出问题）。要加字段就得先挤掉一个，或者在 App 里
+// requestMtu() 并在 onMtuChanged 之后才订阅——目前没那么做。
+_Static_assert(BLE_LINK_STATUS_LEN <= 20, "Notify 装不下超过 20 字节的状态包");
+// [18] 高 7 位放关断下限，超了就截断了
+_Static_assert(CONTROL_SHUTDOWN_C_MAX < 128, "关断阈值上限超过 [18] 的高 7 位");
+// 关断阈值的下限现在跟着预警走（= 预警+1，见 control.h），不是编译期常量。
+// 主循环在 remote_publish() 里填进状态快照，这里读那一份；还没发布过就退回绝对下限。
+static uint16_t shut_min_now(void)
+{
+    uint16_t v;
+    portENTER_CRITICAL(&s_status_lock);
+    v = s_status.shut_min;
+    portEXIT_CRITICAL(&s_status_lock);
+    return v ? v : CONTROL_SHUTDOWN_C_MIN;
+}
+
 static void pack_status(const remote_status_t *st, uint8_t out[BLE_LINK_STATUS_LEN])
 {
     int t10 = st->temp_valid ? (int)(st->temp_c * 10 + (st->temp_c >= 0 ? 0.5f : -0.5f)) : 0;
@@ -123,7 +147,10 @@ static void pack_status(const remote_status_t *st, uint8_t out[BLE_LINK_STATUS_L
 #undef PUT16
     out[16] = st->fault;
     out[17] = st->driver;
-    out[18] = st->on_run_page ? 1 : 0;
+    // 关断下限压进 [18] 的高 7 位，给不出有效值时页面会退回 61（见 ble_link.h）
+    uint16_t shut = st->shut_min ? st->shut_min : CONTROL_SHUTDOWN_C_MIN;
+    out[18] = (uint8_t)((st->on_run_page ? 1 : 0) | (shut << 1));
+    out[19] = (uint8_t)st->shutdown_c;
 }
 #endif
 
@@ -153,6 +180,18 @@ void remote_ble_command(uint8_t op, uint8_t seq, uint16_t value)
     case 1: cmd.kind = REMOTE_CMD_DUTY;  cmd.permille = value > 1000 ? 1000 : value; break;
     case 2: cmd.kind = REMOTE_CMD_TIMER; cmd.minutes = value > 999 ? 999 : value;   break;
     case 3: cmd.kind = REMOTE_CMD_STOP;  break;
+    case 4:
+        // 关断温度：范围在 remote.c 里先把关（下限随预警阈值联动），
+        // 网页/App 能拿到明确的“参数错误”
+        if (value < shut_min_now() || value > CONTROL_SHUTDOWN_C_MAX) {
+            s_ble_seq = seq;
+            s_ble_result = BLE_RESULT_BAD_ARG;
+            s_ble_dirty = true;
+            return;
+        }
+        cmd.kind = REMOTE_CMD_TEMP;
+        cmd.temp_c = value;
+        break;
     default:
         s_ble_seq = seq;
         s_ble_result = BLE_RESULT_BAD_ARG;
@@ -278,6 +317,7 @@ static esp_err_t h_status(httpd_req_t *req)
              "\"vbus\":{\"ok\":%s,\"v9\":%s,\"mv\":%d,\"sat\":%s},"
              "\"temp\":%s,"
              "\"fault\":%u,\"warn\":%s,\"protect\":%s,\"demo\":%s,"
+             "\"shut\":%u,\"shut_min\":%u,\"shut_max\":%u,"
              "\"timer\":{\"on\":%s,\"left\":%lu},\"run_page\":%s,\"driver\":%u}",
              st.pwm, st.setpoint, st.limit,
              st.vbus_ok ? "true" : "false", st.vbus_9v ? "true" : "false", st.vbus_mv,
@@ -285,6 +325,7 @@ static esp_err_t h_status(httpd_req_t *req)
              temp,
              st.fault, st.warn ? "true" : "false", st.protect ? "true" : "false",
              st.demo ? "true" : "false",
+             st.shutdown_c, st.shut_min ? st.shut_min : CONTROL_SHUTDOWN_C_MIN, CONTROL_SHUTDOWN_C_MAX,
              st.timer_active ? "true" : "false", (unsigned long)st.timer_left_s,
              st.on_run_page ? "true" : "false", st.driver);
     return send_json(req, "200 OK", body);
@@ -307,6 +348,17 @@ static esp_err_t h_timer(httpd_req_t *req)
         return send_json(req, "400 Bad Request", "{\"ok\":false,\"err\":\"bad_arg\"}");
     }
     remote_cmd_t cmd = {.kind = REMOTE_CMD_TIMER, .minutes = (uint16_t)min};
+    return run_cmd(req, &cmd);
+}
+
+static esp_err_t h_temp(httpd_req_t *req)
+{
+    long c = query_uint(req, "c", CONTROL_SHUTDOWN_C_MAX);
+    // query_uint 失败回 -1；下限随预警阈值联动，得跟快照比
+    if (c < 0 || c < shut_min_now()) {
+        return send_json(req, "400 Bad Request", "{\"ok\":false,\"err\":\"bad_arg\"}");
+    }
+    remote_cmd_t cmd = {.kind = REMOTE_CMD_TEMP, .temp_c = (uint16_t)c};
     return run_cmd(req, &cmd);
 }
 
@@ -344,6 +396,7 @@ static esp_err_t http_start(void)
         {.uri = "/api/status", .method = HTTP_GET, .handler = h_status},
         {.uri = "/api/duty", .method = HTTP_POST, .handler = h_duty},
         {.uri = "/api/timer", .method = HTTP_POST, .handler = h_timer},
+        {.uri = "/api/temp", .method = HTTP_POST, .handler = h_temp},
         {.uri = "/api/stop", .method = HTTP_POST, .handler = h_stop},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {

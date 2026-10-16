@@ -6,6 +6,7 @@
  *   GET  /api/status        状态 JSON
  *   POST /api/duty?pct=N    设定占空比 N%（0~100，0 = 停止）
  *   POST /api/timer?min=N   定时 N 分钟后关断（1~999），N = 0 取消定时
+ *   POST /api/temp?c=N      过温关断阈值 N℃（下限 = 板上的预警阈值+1，随预警联动；上限 100）
  *   POST /api/stop          立即停止输出
  *
  * 蓝牙 BLE（可选，见 ble_link.h）：与热点同名广播，命令同样进入本模块的命令队列。
@@ -28,6 +29,7 @@ typedef enum {
     REMOTE_CMD_DUTY,    // permille
     REMOTE_CMD_TIMER,   // minutes，0 = 取消
     REMOTE_CMD_STOP,
+    REMOTE_CMD_TEMP,    // temp_c，过温关断阈值
 } remote_cmd_kind_t;
 
 typedef enum {
@@ -37,8 +39,9 @@ typedef enum {
 
 typedef struct {
     remote_cmd_kind_t kind;
-    uint16_t permille;
-    uint16_t minutes;
+    uint16_t permille;      // REMOTE_CMD_DUTY
+    uint16_t minutes;       // REMOTE_CMD_TIMER
+    uint16_t temp_c;        // REMOTE_CMD_TEMP：过温关断阈值（℃）
     uint32_t seq;
     remote_src_t source;
 } remote_cmd_t;
@@ -64,6 +67,10 @@ typedef struct {
     bool temp_valid;
     float temp_c;
     uint8_t fault;                     // ctrl_fault_t
+    uint16_t shutdown_c;               // 过温关断阈值（℃）
+    // 关断阈值的下限，= 预警+1，随预警阈值联动（见 control.h），
+    // 所以不能写成编译期常量。上限仍是 CONTROL_SHUTDOWN_C_MAX。
+    uint16_t shut_min;
     bool warn, protect, demo;
     uint8_t driver;                    // ctrl_driver_t
     bool timer_active;
@@ -83,7 +90,7 @@ bool remote_ble_running(void);
 const char *remote_ble_name(void);
 remote_link_t remote_link(void);
 
-// 蓝牙命令入口（由 ble_link 在 NimBLE 任务中调用）：op 1 占空比 / 2 定时 / 3 停止
+// 蓝牙命令入口（由 ble_link 在 NimBLE 任务中调用）：op 1 占空比 / 2 定时 / 3 停止 / 4 关断温度
 void remote_ble_command(uint8_t op, uint8_t seq, uint16_t value);
 const char *remote_ssid(void);
 const char *remote_password(void);

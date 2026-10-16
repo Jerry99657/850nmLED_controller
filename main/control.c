@@ -50,6 +50,14 @@ static uint32_t s_softstart_ms = CONFIG_LED_PWM_SOFTSTART_MS;
 static bool s_led_enable = true;
 static uint8_t s_led_brightness = CONFIG_WS2812_BRIGHTNESS_PERCENT;
 static bool s_protect = true;               // 温度保护，由 UI 按保存的设置设定
+static uint16_t s_shutdown_c = CONFIG_THERMAL_SHUTDOWN_C;  // 过温关断阈值，可在运行时修改
+static uint16_t s_warn_c = CONFIG_THERMAL_WARN_C;          // 预警阈值，可在运行时修改
+static uint16_t s_resume_c = CONFIG_THERMAL_RESUME_C;      // 过温恢复阈值，可在运行时修改
+// 过温关断后等温度降到 s_resume_c 以下再自动恢复：
+// 记下关断前的设定值和关断时刻，恢复时把设定值还回去，并把定时暂停掉的时间补回来。
+static bool s_overtemp_hold;
+static uint16_t s_hold_setpoint;
+static uint32_t s_hold_start_ms;
 static uint8_t s_idle_rgb[3] = {0, 0, 255}; // 页面颜色（满亮度），按 s_led_brightness 缩放
 static uint8_t s_led_shown[3];
 static bool s_led_valid;
@@ -122,13 +130,37 @@ static void thermal_update(void)
     }
     if (!temp_valid()) {
         set_fault(CTRL_FAULT_TEMP_SENSOR);
-    } else if (s_temp >= CONFIG_THERMAL_SHUTDOWN_C) {
+    } else if (s_temp >= s_shutdown_c) {
+        // 只在这一轮刚进入过温时记一次：set_fault() 会把设定值清零
+        if (!s_overtemp_hold) {
+            s_overtemp_hold = true;
+            s_hold_setpoint = s_setpoint;
+            s_hold_start_ms = s_now;
+            if (s_hold_setpoint) {
+                ESP_LOGW(TAG, "overtemp %.1f C >= %u C, holding %u.%u%% until %u C",
+                         s_temp, s_shutdown_c, s_hold_setpoint / 10, s_hold_setpoint % 10,
+                         s_resume_c);
+            }
+        }
         set_fault(CTRL_FAULT_OVERTEMP);
-    } else if (s_fault_thermal != CTRL_FAULT_NONE && s_temp < CONFIG_THERMAL_WARN_C) {
-        // 故障解除后亮度设定保持 0，需重新按键开启
+    } else if (s_fault_thermal != CTRL_FAULT_NONE && s_temp < s_resume_c) {
+        // 降到恢复温度以下：解除故障，过温的话把关断前的输出还回去
         ESP_LOGW(TAG, "fault cleared (%s)", fault_name(s_fault_thermal));
         s_fault_thermal = CTRL_FAULT_NONE;
         fault_recompute();
+        if (s_overtemp_hold) {
+            s_overtemp_hold = false;
+            if (s_hold_setpoint) {      // 关断时本来就没输出（设定为 0）就不要自己开起来
+                uint16_t limit = led_pwm_get_limit();
+                s_setpoint = s_hold_setpoint > limit ? limit : s_hold_setpoint;
+                if (s_timer_active) {
+                    s_timer_end_ms += s_now - s_hold_start_ms;
+                }
+                ESP_LOGW(TAG, "overtemp recovery %.1f C, resume %u.%u%% (%s)",
+                         s_temp, s_setpoint / 10, s_setpoint % 10,
+                         s_timer_active ? "timer resumed" : "no timer");
+            }
+        }
     }
 }
 
@@ -274,7 +306,7 @@ static void status_led_update(uint32_t now_ms)
         led_out(r ? (uint8_t)r : 1, 0, 0);
     } else if (!s_led_enable) {
         led_out(0, 0, 0);
-    } else if (temp_valid() && s_temp >= CONFIG_THERMAL_WARN_C) {
+    } else if (temp_valid() && s_temp >= s_warn_c) {
         led_out(b, b / 4, 0);
     } else {
         led_out(s_idle_rgb[0] * b / 255, s_idle_rgb[1] * b / 255, s_idle_rgb[2] * b / 255);
@@ -350,11 +382,12 @@ static void timer_update(void)
     if (!s_timer_active) {
         return;
     }
-    if (s_setpoint == 0) {
-        // 停止、故障、离开运行页等任何原因归零都取消定时
+    if (s_setpoint == 0 && !s_overtemp_hold) {
+        // 停止、故障、离开运行页等任何原因归零都取消定时。
+        // 过温关断例外：输出停着但定时只是暂停，降温恢复后接着走。
         s_timer_active = false;
         ESP_LOGI(TAG, "timer cancelled (output off)");
-    } else if ((int32_t)(s_now - s_timer_end_ms) >= 0) {
+    } else if (s_setpoint != 0 && (int32_t)(s_now - s_timer_end_ms) >= 0) {
         s_timer_active = false;
         s_timer_expired = true;
         s_setpoint = 0;
@@ -462,7 +495,10 @@ void control_get_status(ctrl_status_t *out)
     out->setpoint = s_setpoint;
     out->limit = led_pwm_get_limit();
     out->fault = s_fault;
-    out->warn = temp_valid() && s_temp >= CONFIG_THERMAL_WARN_C;
+    out->warn = temp_valid() && s_temp >= s_warn_c;
+    out->shutdown_c = s_shutdown_c;
+    out->warn_c = s_warn_c;
+    out->resume_c = s_resume_c;
     out->demo = DEMO_ENABLED;
     out->protect = s_protect;
     out->vbus_ok = s_vbus_ok;
@@ -485,6 +521,60 @@ void control_set_softstart_ms(uint32_t ms)
     s_softstart_ms = ms;
 }
 
+// 三档阈值的范围联动（见 control.h）：设置页按当前值算出可调范围，正常路径
+// 传进来的值一定合法。这里只是兜底——万一范围是旧快照或者 NVS 里存过乱序值，
+// 宁可把值顶到边界，也不能让 恢复 < 预警 < 关断 被破坏。
+void control_set_shutdown_c(uint16_t c)
+{
+    // 预警上限 99，所以这里是 ≤ 100，不会越过 CONTROL_SHUTDOWN_C_MAX
+    if (c < (uint16_t)(s_warn_c + 1)) {
+        c = (uint16_t)(s_warn_c + 1);
+    } else if (c > CONTROL_SHUTDOWN_C_MAX) {
+        c = CONTROL_SHUTDOWN_C_MAX;
+    }
+    if (c == s_shutdown_c) {
+        return;
+    }
+    s_shutdown_c = c;
+    ESP_LOGI(TAG, "shutdown threshold %u C", c);
+    thermal_update();   // 调低到当前温度以下时立即关断，不等下一个采样周期
+}
+
+void control_set_warn_c(uint16_t c)
+{
+    // 夹在恢复和关断之间。顺序没坏时 s_resume_c + 1 <= s_shutdown_c - 1 恒成立，
+    // 所以这里不会算出空区间。
+    if (c < (uint16_t)(s_resume_c + 1)) {
+        c = (uint16_t)(s_resume_c + 1);
+    } else if (c > (uint16_t)(s_shutdown_c - 1)) {
+        c = (uint16_t)(s_shutdown_c - 1);
+    }
+    if (c == s_warn_c) {
+        return;
+    }
+    s_warn_c = c;
+    ESP_LOGI(TAG, "warn threshold %u C", c);
+    // 只影响状态灯颜色和状态页显示，下一次 control_update 就会刷新
+}
+
+void control_set_resume_c(uint16_t c)
+{
+    // 必须低于预警。下限是 0（= 永不自动恢复），无符号参数不可能低于它，不用判。
+    uint16_t hi = (uint16_t)(s_warn_c - 1);
+    if (hi > CONTROL_RESUME_C_MAX) {
+        hi = CONTROL_RESUME_C_MAX;
+    }
+    if (c > hi) {
+        c = hi;
+    }
+    if (c == s_resume_c) {
+        return;
+    }
+    s_resume_c = c;
+    ESP_LOGI(TAG, "resume threshold %u C", c);
+    thermal_update();   // 调高到当前温度以上时立即解除过温并恢复输出
+}
+
 void control_set_thermal_protect(bool enable)
 {
     if (enable == s_protect) {
@@ -497,6 +587,7 @@ void control_set_thermal_protect(bool enable)
     } else {
         // 清除已锁存的温度故障（驱动故障不受影响）；亮度设定已在故障时清零，需重新按键开启
         s_fault_thermal = CTRL_FAULT_NONE;
+        s_overtemp_hold = false;    // 保护都关了，不要再自动恢复输出
         fault_recompute();
         ESP_LOGW(TAG, "thermal protection OFF, limit stays %u.%u%%",
                  led_pwm_get_limit() / 10, led_pwm_get_limit() % 10);
@@ -508,6 +599,8 @@ void control_force_off(void)
     if (s_setpoint || led_pwm_get()) {
         ESP_LOGI(TAG, "force off (was %u.%u%%)", led_pwm_get() / 10, led_pwm_get() % 10);
     }
+    // 人主动停的（停止按钮、离开运行页）：取消待恢复的过温输出，别回来时自己开起来
+    s_overtemp_hold = false;
     s_setpoint = 0;
     s_ramp_q = 0;
     led_pwm_off();

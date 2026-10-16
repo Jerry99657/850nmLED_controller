@@ -15,6 +15,9 @@ typedef struct {
     int32_t led_brightness;
     bool led_enable;
     bool protect;
+    int32_t shutdown_c;     // 过温关断阈值（℃）
+    int32_t warn_c;         // 预警阈值（℃）
+    int32_t resume_c;       // 过温恢复阈值（℃）
 } app_settings_t;
 
 // 初始化 NVS；失败时设置只保存在 RAM

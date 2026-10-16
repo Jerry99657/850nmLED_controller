@@ -9,6 +9,32 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "driver/i2c_master.h"
+#include "sdkconfig.h"
+
+/*
+ * 三个温度阈值必须保持 恢复 < 预警 < 关断：
+ *   关断  温度到这儿就切输出
+ *   预警  状态灯转橙色、状态页显示“温度预警”，纯提示，不影响输出
+ *   恢复  过温关断后降到这儿以下自动接着输出
+ * 关断和恢复挨得太近会来回打摆：刚恢复就再次关断。
+ *
+ * 顺序靠“范围联动”保证：每个阈值的可调范围由另外两个的当前值算出来，
+ * 所以怎么按都设不坏。范围在 ui_app.c 的 cfg_update_ranges() 里每改一次值就重算：
+ *   恢复  0 ~ 预警-1 ／ 预警  恢复+1 ~ 关断-1 ／ 关断  预警+1 ~ 100
+ * 关断的实时下限因此跟着预警走（默认预警 55 → 关断最低 56）。
+ *
+ * 下面这几个只留绝对上下限：给 Kconfig 默认值和旧的 NVS 值兜底，
+ * 也保证联动算出来的区间不会是空的（先钳绝对范围，顺序就总成立）。
+ * 关断的实时下限不是常量，网页和手机 App 要用 remote_status_t.shut_min，
+ * 别在页面里写死（tools/ble_control.html 从状态包字节 [20] 的预警值算出来）。
+ * 这三个值在 Kconfig 里各有一份对应的 range，改这里记得一起改。
+ */
+#define CONTROL_RESUME_C_MIN    0
+#define CONTROL_RESUME_C_MAX    90
+#define CONTROL_WARN_C_MIN      2
+#define CONTROL_WARN_C_MAX      99
+#define CONTROL_SHUTDOWN_C_MIN  3
+#define CONTROL_SHUTDOWN_C_MAX  100
 
 typedef enum {
     CTRL_FAULT_NONE = 0,
@@ -33,6 +59,9 @@ typedef struct {
     uint16_t limit;         // 占空比上限，千分比
     ctrl_fault_t fault;
     bool warn;              // 温度达到预警阈值
+    uint16_t shutdown_c;    // 过温关断阈值，可在运行时修改
+    uint16_t warn_c;        // 预警阈值
+    uint16_t resume_c;      // 过温恢复阈值
     bool demo;              // 阶梯测试模式
     bool protect;           // 温度保护是否开启
     bool vbus_ok;           // VBUS ADC 可用
@@ -72,6 +101,24 @@ bool control_take_vbus_stop(void);
 void control_get_status(ctrl_status_t *out);
 
 void control_set_softstart_ms(uint32_t ms);
+
+/*
+ * 设定过温关断阈值（℃）。低于 预警+1 时顶到 预警+1（保证 预警 < 关断），
+ * 高于 CONTROL_SHUTDOWN_C_MAX 时钳位。
+ * 调低到当前温度以下会立即判定并锁存过温故障（下一次 control_update 之前生效）。
+ */
+void control_set_shutdown_c(uint16_t c);
+
+/*
+ * 设定预警阈值（℃），钳到 (恢复, 关断) 之间。只影响状态灯颜色和状态显示。
+ */
+void control_set_warn_c(uint16_t c);
+
+/*
+ * 设定过温恢复阈值（℃），高于 预警-1 时顶到 预警-1（保证 恢复 < 预警）。
+ * 调高到当前温度以上会立即解除已锁存的过温故障并恢复输出。
+ */
+void control_set_resume_c(uint16_t c);
 
 // 关闭后不再因过温或传感器故障关断输出（仍受占空比上限约束），并清除已锁存的温度故障；
 // 重新开启时立即判定。

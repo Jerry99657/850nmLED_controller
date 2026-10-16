@@ -75,18 +75,35 @@ menu "850nm LED Controller"
 
     menu "Thermal protection"
 
+        # 三个阈值必须保持 恢复 < 预警 < 关断。运行时在板上设置页改的时候，
+        # 三者的可调范围是联动的（ui_app.c 的 cfg_update_ranges()），顺序按不坏。
+        # 这里只是上电默认值，range 用绝对上下限。改 range 时记得同步
+        # main/control.h 里的 CONTROL_*_C_MIN/MAX。
+
         config THERMAL_WARN_C
             int "Warning threshold (C)"
-            range 30 100
+            range 2 99
             default 55
+            help
+                状态灯转橙色、状态页显示“温度预警”的温度。只做提示，不影响输出。
+                它同时决定关断阈值的下限（= 预警 + 1）。
 
         config THERMAL_SHUTDOWN_C
             int "Shutdown threshold (C)"
-            range 30 120
+            range 3 100
             default 70
             help
-                达到该温度立即关断 LED_PWM 并锁存故障；
-                温度回落到预警阈值以下后解除，亮度设定清零，需重新按键开启。
+                达到该温度立即关断 LED_PWM 并锁存过温故障。
+                设置页里的下限跟着预警阈值走（预警 + 1）。
+
+        config THERMAL_RESUME_C
+            int "Resume threshold (C)"
+            range 0 90
+            default 50
+            help
+                过温关断后温度降到该值以下，自动按关断前的设定值恢复输出（走软启动斜坡），
+                定时关断的剩余时间接着走。设置页里的上限跟着预警阈值走（预警 - 1），
+                离关断阈值太近会来回打摆。温度传感器故障、LED 驱动故障仍是锁定式，不受该项影响。
 
     endmenu
 

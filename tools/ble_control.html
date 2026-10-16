@@ -92,6 +92,19 @@
   </div>
 </div>
 
+<div class="card" id="tCard" hidden>
+  <label>过温关断温度（℃）——温度到达此值立即关断，掉电保存</label>
+  <div class="row">
+    <button id="tDown" style="flex:1;font-size:22px">−</button>
+    <div id="tempC" style="flex:1;text-align:center;font-size:26px;font-weight:600">--</div>
+    <button id="tUp" style="flex:1;font-size:22px">＋</button>
+  </div>
+  <p class="note" style="margin:10px 0 0">可调范围 <span id="tRange">--</span>（下限跟着板上的预警温度走，
+    预警调高了这里也跟着抬）。调低到当前温度以下会立刻关断；温度降下来之后会按关断前的设定值
+    自己恢复输出，定时接着走。觉得板子太烫就往下调，但别调得太接近正常工作的温度。<br>
+    预警温度和恢复温度只能在板子的“设置”页里改，本页和手机 App 不提供。</p>
+</div>
+
 <button class="stop" id="stop">停止输出</button>
 </div>
 
@@ -106,15 +119,26 @@ const SVC = '9e5d0001-3c1a-4b8e-9f2d-850e0a1c0001';
 const CMD = '9e5d0002-3c1a-4b8e-9f2d-850e0a1c0001';
 const STA = '9e5d0003-3c1a-4b8e-9f2d-850e0a1c0001';
 const NAME_PREFIX = '850nm-';
-const OP = { DUTY: 1, TIMER: 2, STOP: 3 };
+const OP = { DUTY: 1, TIMER: 2, STOP: 3, TEMP: 4 };
+// 关断阈值范围。上限是 control.h 的 CONTROL_SHUTDOWN_C_MAX（固定 100）；
+// 下限跟着板上的预警阈值走（= 预警+1），由状态包字节 [18] 的高 7 位带过来，
+// 别在这里写死：板上把预警调高，关断的下限也跟着抬高。
+// 字节 [18] 的高 7 位为 0 说明板子还是旧固件（阈值范围当时是固定的 61~100，
+// 这一字节只放了“在运行页”标志），用 LEGACY_SHUT_MIN 兜底，卡片照样显示
+// ——不能因为读不到下限就把功能藏掉。
+const LEGACY_SHUT_MIN = 61;
+let SHUT_MIN = LEGACY_SHUT_MIN, SHUT_MAX = 100;
 const RESULT = ['', '故障锁定或阶梯测试中，无法输出', '请先设定占空比开启输出，再开始定时', '板子忙，请重试', '参数错误'];
 const FAULT = { 1: '温度传感器故障', 2: '过温关断', 3: 'LED驱动配置失败' };
+// 过温是自动恢复的：降温后按关断前的设定值接着输出，这里说明一下
+const FAULT_ROW = { 2: '过温关断，降温后恢复输出' };
 const DRV = ['无供电（仅下载口）', '配置中', '已配置 5 路', '配置失败'];
 
 // 在 Android App 里运行时由原生代码注入 NativeBle；在浏览器里用 Web Bluetooth
 const NATIVE = window.NativeBle || null;
 const $ = id => document.getElementById(id);
 let link = 'off', linkName = '', seq = 0, lastSeq = 0, pending = null, editing = 0;
+let shut = 0, shutTouched = 0, shutTimer = 0;
 
 const pct = v => (v % 10 ? (v / 10).toFixed(1) : v / 10) + '%';
 const mmss = s => { const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, x = s % 60;
@@ -135,16 +159,26 @@ function setLink(state, name) {
 }
 
 // 状态包 20 字节，格式见固件 remote.c pack_status()
+// 长度必须锁死在 20：手机默认 ATT MTU 是 23，一条 Notify 最多只能带 23-3=20 字节，
+// 长一个字节板子发得出、手机收不到（会被截断）。21 字节的包只在连接时那一次
+// Read 里完整（Read 上限是 22），随后的 Notify 就短一截——0.3.0 的卡片消失就是这么来的。
 function handleStatus(d) {
   if (d.byteLength < 20 || d.getUint8(0) !== 1) return;
   const f = d.getUint8(3);
+  // 字节 [18]：bit0 = 在运行页，bits1~7 = 关断下限（板上预警阈值 + 1）。
+  // 旧固件这一字节只有 0/1（没有运行页时甚至是 0），右移 7 位后是 0，用 LEGACY 兜底。
+  const shutMin = d.getUint8(18) >> 1;
   const s = {
     seq: d.getUint8(1), res: d.getUint8(2),
     vbusOk: f & 1, v9: f & 2, sat: f & 4, tempOk: f & 8, warn: f & 16, protect: f & 32, demo: f & 64, timerOn: f & 128,
     pwm: d.getUint16(4, true), set: d.getUint16(6, true), limit: d.getUint16(8, true),
     mv: d.getUint16(10, true), temp: d.getInt16(12, true) / 10, left: d.getUint16(14, true),
     fault: d.getUint8(16), drv: d.getUint8(17),
+    shut: d.getUint8(19),
+    // 固件给的下限一定 ≥ 3（预警下限 2），所以 ≤ 1 就是旧固件，退回它当年的固定下限
+    shutMin: shutMin > 1 ? shutMin : LEGACY_SHUT_MIN,
   };
+  SHUT_MIN = s.shutMin;
   lastSeq = s.seq;
   if (pending && s.seq === pending.seq) { pending.resolve(s.res); pending = null; }
   render(s);
@@ -157,7 +191,7 @@ function render(s) {
   $('limit').textContent = pct(s.limit);
   $('vbus').textContent = !s.vbusOk ? '--' : (s.v9 ? '9V' : '5V') + '（' + (s.sat ? '>' : '') + (s.mv / 1000).toFixed(1) + 'V）';
   $('temp').textContent = s.tempOk ? s.temp.toFixed(1) + ' ℃' : '--';
-  $('prot').textContent = !s.protect ? '已关闭' : s.fault ? FAULT[s.fault] : (s.warn ? '温度预警' : '正常');
+  $('prot').textContent = !s.protect ? '已关闭' : s.fault ? (FAULT_ROW[s.fault] || FAULT[s.fault]) : (s.warn ? '温度预警' : '正常');
   $('drv').textContent = DRV[s.drv] || '--';
   $('timer').textContent = s.timerOn ? '剩余 ' + mmss(s.left) : '未开启';
   const st = $('state');
@@ -167,6 +201,37 @@ function render(s) {
   else { st.textContent = '待机'; st.className = 'tag'; }
   $('dutyR').max = $('dutyN').max = s.limit / 10;
   if (Date.now() - editing > 3000) { $('dutyR').value = $('dutyN').value = Math.round(s.set / 10); }
+  // 字节 [19] 为 0 说明板子连这项功能都还没有（比字节 [18] 那版更早的固件），才隐藏这张卡
+  $('tCard').hidden = !(s.shut >= s.shutMin && s.shut <= SHUT_MAX);
+  if (!$('tCard').hidden) {
+    if (Date.now() - shutTouched > 3000) { shut = s.shut; }
+    shutRender();
+  }
+}
+
+function shutRender() {
+  $('tempC').textContent = shut + ' ℃';
+  $('tRange').textContent = SHUT_MIN + ' ~ ' + SHUT_MAX;
+  $('tDown').disabled = shut <= SHUT_MIN;
+  $('tUp').disabled = shut >= SHUT_MAX;
+}
+
+// 连点 +/- 时等上一条命令的结果回来再发下一条：命令队列只有 2 格，
+// 并发发出去的话板子会直接回“板子忙”，而且 send() 还会把未决的 promise 判成超时。
+function shutPush() {
+  clearTimeout(shutTimer);
+  shutTimer = 0;
+  if (link !== 'on') return;
+  if (pending) { shutTimer = setTimeout(shutPush, 250); return; }
+  send(OP.TEMP, shut);
+}
+
+function shutStep(d) {
+  shut = Math.max(SHUT_MIN, Math.min(SHUT_MAX, shut + d));
+  shutTouched = Date.now();
+  shutRender();
+  clearTimeout(shutTimer);
+  shutTimer = setTimeout(shutPush, 250);
 }
 
 // 写命令，等待状态通知带回同一 seq 的结果
@@ -316,6 +381,8 @@ $('startT').onclick = () => { const m = +$('minN').value | 0;
   if (m < 1 || m > 999) { msg('定时范围 1~999 分钟'); return; } send(OP.TIMER, m); };
 $('cancelT').onclick = () => send(OP.TIMER, 0);
 $('stop').onclick = () => { editing = 0; send(OP.STOP, 0); };
+$('tDown').onclick = () => shutStep(-1);
+$('tUp').onclick = () => shutStep(1);
 
 setLink('off');
 if (!NATIVE && (!navigator.bluetooth || !window.isSecureContext)) {

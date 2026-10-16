@@ -68,6 +68,19 @@
   </div>
 </div>
 
+<div class="card" id="tCard" hidden>
+  <label>过温关断温度（℃）——温度到达此值立即关断，掉电保存</label>
+  <div class="row">
+    <button id="tDown" style="flex:1;font-size:22px">−</button>
+    <div id="tempC" style="flex:1;text-align:center;font-size:26px;font-weight:600">--</div>
+    <button id="tUp" style="flex:1;font-size:22px">＋</button>
+  </div>
+  <p class="note" style="margin:10px 0 0">可调范围 <span id="tRange">--</span>（下限跟着板上的预警温度走，
+    预警调高了这里也跟着抬）。调低到当前温度以下会立刻关断；温度降下来之后会按关断前的设定值
+    自己恢复输出，定时接着走。觉得板子太烫就往下调，但别调得太接近正常工作的温度。<br>
+    预警温度和恢复温度只能在板子的“设置”页里改，本页和手机 App 不提供。</p>
+</div>
+
 <button class="stop" id="stop">停止输出</button>
 <div id="msg"></div>
 <p class="note">850 nm 红外光肉眼几乎不可见，请勿直视发光面，以本页或板上红色状态灯判断是否在输出。设定占空比会让板子自动进入“运行”页；板上离开运行页、故障或定时到时都会立即归零。</p>
@@ -77,8 +90,13 @@ const $ = id => document.getElementById(id);
 const ERR = { locked: '故障锁定或阶梯测试中，无法输出', not_running: '请先设定占空比开启输出，再开始定时',
               busy: '板子界面忙，请重试', timeout: '板子无响应', bad_arg: '参数错误' };
 const FAULT = { 1: '温度传感器故障', 2: '过温关断', 3: 'LED驱动配置失败' };
+// 过温是自动恢复的：降温后按关断前的设定值接着输出，这里说明一下
+const FAULT_ROW = { 2: '过温关断，降温后恢复输出' };
 const DRV = ['无供电（仅下载口）', '配置中', '已配置 5 路', '配置失败'];
 let editing = 0;
+
+// 过温关断阈值：本地先改显示，停手 250 ms 再发一条（连点 +/- 不会打满命令队列）
+let shut = 0, shutMin = 0, shutMax = 0, shutTouched = 0, shutTimer = 0;
 
 const pct = v => (v % 10 ? (v / 10).toFixed(1) : v / 10) + '%';
 const mmss = s => { const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, x = s % 60;
@@ -105,7 +123,7 @@ async function poll() {
     $('vbus').textContent = !s.vbus.ok ? '--' : (s.vbus.v9 ? '9V' : '5V') + '（' +
       (s.vbus.sat ? '>' : '') + (s.vbus.mv / 1000).toFixed(1) + 'V）';
     $('temp').textContent = s.temp === null ? '--' : s.temp.toFixed(1) + ' ℃';
-    $('prot').textContent = !s.protect ? '已关闭' : s.fault ? FAULT[s.fault] : (s.warn ? '温度预警' : '正常');
+    $('prot').textContent = !s.protect ? '已关闭' : s.fault ? (FAULT_ROW[s.fault] || FAULT[s.fault]) : (s.warn ? '温度预警' : '正常');
     $('drv').textContent = DRV[s.driver] || '--';
     $('timer').textContent = s.timer.on ? '剩余 ' + mmss(s.timer.left) : '未开启';
     const st = $('state');
@@ -115,6 +133,17 @@ async function poll() {
     else { st.textContent = '待机'; st.className = 'tag'; }
     $('dutyR').max = $('dutyN').max = s.limit / 10;
     if (Date.now() - editing > 3000) { $('dutyR').value = $('dutyN').value = Math.round(s.set / 10); }
+
+    // 旧固件的状态字节里没有这一项（shut 为 0），直接不显示这张卡
+    shutMin = s.shut_min || 0; shutMax = s.shut_max || 0;
+    $('tCard').hidden = !(shutMin > 0 && shutMax > shutMin);
+    if (!$('tCard').hidden) {
+      if (Date.now() - shutTouched > 3000) { shut = s.shut; }
+      $('tempC').textContent = shut + ' ℃';
+      $('tRange').textContent = shutMin + ' ~ ' + shutMax;
+      $('tDown').disabled = shut <= shutMin;
+      $('tUp').disabled = shut >= shutMax;
+    }
   } catch (e) { $('state').textContent = '未连接'; $('state').className = 'tag'; }
 }
 
@@ -126,6 +155,18 @@ $('setDuty').onclick = () => { editing = 0; call('/api/duty?pct=' + Math.max(0, 
 $('startT').onclick = () => { const m = +$('minN').value | 0;
   if (m < 1 || m > 999) { msg('定时范围 1~999 分钟'); return; } call('/api/timer?min=' + m); };
 $('cancelT').onclick = () => call('/api/timer?min=0');
+
+function shutStep(d) {
+  shut = Math.max(shutMin, Math.min(shutMax, shut + d));
+  shutTouched = Date.now();
+  $('tempC').textContent = shut + ' ℃';
+  $('tDown').disabled = shut <= shutMin;
+  $('tUp').disabled = shut >= shutMax;
+  clearTimeout(shutTimer);
+  shutTimer = setTimeout(() => { shutTouched = Date.now(); call('/api/temp?c=' + shut); }, 250);
+}
+$('tDown').onclick = () => shutStep(-1);
+$('tUp').onclick = () => shutStep(1);
 $('stop').onclick = () => { editing = 0; call('/api/stop'); };
 
 poll();

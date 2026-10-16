@@ -13,6 +13,9 @@
 #define KEY_LED_BRI     "led_bri"
 #define KEY_LED_EN      "led_en"
 #define KEY_PROTECT     "protect"
+#define KEY_SHUTDOWN_C  "shut_c"
+#define KEY_WARN_C      "warn_c"
+#define KEY_RESUME_C    "resum_c"
 
 static const char *TAG = "settings";
 
@@ -53,10 +56,15 @@ void settings_load(app_settings_t *s)
     if (nvs_get_u8(h, KEY_PROTECT, &en) == ESP_OK) {
         s->protect = en != 0;
     }
+    nvs_get_i32(h, KEY_SHUTDOWN_C, &s->shutdown_c);
+    nvs_get_i32(h, KEY_WARN_C, &s->warn_c);
+    nvs_get_i32(h, KEY_RESUME_C, &s->resume_c);
     nvs_close(h);
-    ESP_LOGI(TAG, "loaded: softstart %ld ms, step %ld%%, led %s %ld%%, thermal protect %s",
+    ESP_LOGI(TAG, "loaded: softstart %ld ms, step %ld%%, led %s %ld%%, thermal protect %s, "
+             "temp shutdown %ld C, warn %ld C, resume %ld C",
              (long)s->softstart_ms, (long)s->step_percent,
-             s->led_enable ? "on" : "off", (long)s->led_brightness, s->protect ? "on" : "off");
+             s->led_enable ? "on" : "off", (long)s->led_brightness, s->protect ? "on" : "off",
+             (long)s->shutdown_c, (long)s->warn_c, (long)s->resume_c);
     if (!s->protect) {
         ESP_LOGW(TAG, "thermal protection is OFF (saved setting)");
     }
@@ -78,6 +86,9 @@ esp_err_t settings_save(const app_settings_t *s)
     if (err == ESP_OK) err = nvs_set_i32(h, KEY_LED_BRI, s->led_brightness);
     if (err == ESP_OK) err = nvs_set_u8(h, KEY_LED_EN, s->led_enable);
     if (err == ESP_OK) err = nvs_set_u8(h, KEY_PROTECT, s->protect);
+    if (err == ESP_OK) err = nvs_set_i32(h, KEY_SHUTDOWN_C, s->shutdown_c);
+    if (err == ESP_OK) err = nvs_set_i32(h, KEY_WARN_C, s->warn_c);
+    if (err == ESP_OK) err = nvs_set_i32(h, KEY_RESUME_C, s->resume_c);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
     if (err != ESP_OK) {

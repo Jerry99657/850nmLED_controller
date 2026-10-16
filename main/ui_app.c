@@ -25,6 +25,7 @@
 #include "ui_icons.h"
 
 #define INFO_REFRESH_MS     500
+#define CFG_SAVE_DELAY_MS   2000    // 手机连点 +/- 时攒着，停手后再写 NVS
 
 enum {
     PAGE_HOME = 1,
@@ -41,9 +42,12 @@ enum {
     EVT_RESET_CONFIRMED,
     EVT_RESET_CANCELLED,
     EVT_PROTECT_CHANGED,
+    EVT_SHUTDOWN_CHANGED,
+    EVT_WARN_CHANGED,
+    EVT_RESUME_CHANGED,
 };
 
-enum { INT_SOFTSTART, INT_STEP, INT_LED_BRIGHTNESS };
+enum { INT_SOFTSTART, INT_STEP, INT_LED_BRIGHTNESS, INT_SHUTDOWN, INT_WARN, INT_RESUME };
 enum { BOOL_PROTECT, BOOL_LED };
 enum { CONFIRM_RESET };
 
@@ -54,6 +58,37 @@ static int32_t s_step_percent;
 static int32_t s_led_brightness;
 static bool s_led_enable;
 static bool s_protect;
+static int32_t s_shutdown_c;
+static int32_t s_warn_c;
+static int32_t s_resume_c;
+
+static int32_t in_range(int32_t v, int32_t lo, int32_t hi, int32_t def)
+{
+    return v < lo || v > hi ? def : v;
+}
+
+/*
+ * 三个温度阈值必须保持 恢复 < 预警 < 关断，这里负责把任意来源的值整顺，
+ * 见 control.h。menuconfig 里填的默认值本身就可能前后矛盾（比如预警 30、
+ * 恢复 50），旧固件存下的 NVS 值更是可能落在新范围外，所以两条路都要过一遍。
+ *
+ * 顺序从低往高顶：先把预警顶到恢复之上，再把关断顶到预警之上，
+ * 反过来的话预警被顶起来后关断又不够高了。顶完一定落在绝对范围内
+ * （恢复 ≤ 90 时预警最多 91，仍低于 CONTROL_WARN_C_MAX）。
+ * 必须在 KK_UI_Init() 之前跑完，它的绑定校验要求当前值落在 [min,max] 里。
+ */
+static void cfg_thermal_normalize(void)
+{
+    s_shutdown_c = in_range(s_shutdown_c, CONTROL_SHUTDOWN_C_MIN, CONTROL_SHUTDOWN_C_MAX, CONFIG_THERMAL_SHUTDOWN_C);
+    s_warn_c = in_range(s_warn_c, CONTROL_WARN_C_MIN, CONTROL_WARN_C_MAX, CONFIG_THERMAL_WARN_C);
+    s_resume_c = in_range(s_resume_c, CONTROL_RESUME_C_MIN, CONTROL_RESUME_C_MAX, CONFIG_THERMAL_RESUME_C);
+    if (s_warn_c < s_resume_c + 1) {
+        s_warn_c = s_resume_c + 1;
+    }
+    if (s_shutdown_c < s_warn_c + 1) {
+        s_shutdown_c = s_warn_c + 1;
+    }
+}
 
 static void cfg_defaults(void)
 {
@@ -62,41 +97,57 @@ static void cfg_defaults(void)
     s_led_brightness = CONFIG_WS2812_BRIGHTNESS_PERCENT;
     s_led_enable = true;
     s_protect = true;
-}
-
-static int32_t in_range(int32_t v, int32_t lo, int32_t hi, int32_t def)
-{
-    return v < lo || v > hi ? def : v;
+    s_shutdown_c = CONFIG_THERMAL_SHUTDOWN_C;
+    s_warn_c = CONFIG_THERMAL_WARN_C;
+    s_resume_c = CONFIG_THERMAL_RESUME_C;
+    cfg_thermal_normalize();
 }
 
 // 读出的值超出编辑范围时回到默认，避免 KK_UI_Init() 校验失败
 static void cfg_load(void)
 {
-    app_settings_t s = {s_softstart_ms, s_step_percent, s_led_brightness, s_led_enable, s_protect};
+    app_settings_t s = {s_softstart_ms, s_step_percent, s_led_brightness, s_led_enable, s_protect,
+                        s_shutdown_c, s_warn_c, s_resume_c};
     settings_load(&s);
     s_softstart_ms = in_range(s.softstart_ms, 100, 2000, s_softstart_ms);
     s_step_percent = in_range(s.step_percent, 1, 10, s_step_percent);
     s_led_brightness = in_range(s.led_brightness, 5, 100, s_led_brightness);
     s_led_enable = s.led_enable;
     s_protect = s.protect;
+    s_shutdown_c = s.shutdown_c;
+    s_warn_c = s.warn_c;
+    s_resume_c = s.resume_c;
+    cfg_thermal_normalize();
 }
 
 static bool cfg_save(void)
 {
-    const app_settings_t s = {s_softstart_ms, s_step_percent, s_led_brightness, s_led_enable, s_protect};
+    const app_settings_t s = {s_softstart_ms, s_step_percent, s_led_brightness, s_led_enable, s_protect,
+                              s_shutdown_c, s_warn_c, s_resume_c};
     return settings_save(&s) == ESP_OK;
 }
+
+// 定义在下面 int_bindings 之后（要用到那张表）
+static void cfg_update_ranges(void);
 
 static void cfg_apply(void)
 {
     control_set_softstart_ms((uint32_t)s_softstart_ms);
     control_set_status_led(s_led_enable, (uint8_t)s_led_brightness);
     control_set_thermal_protect(s_protect);
+    control_set_shutdown_c((uint16_t)s_shutdown_c);
+    control_set_warn_c((uint16_t)s_warn_c);
+    control_set_resume_c((uint16_t)s_resume_c);
+    // 任何一条路径改了阈值（设置页、网页、手机 App）都从这里出去，范围在这儿重算
+    cfg_update_ranges();
 }
 
 /* ---------- 动态文本 ---------- */
 
 static char s_txt_temp[16];
+static char s_txt_shut[16];
+static char s_txt_warn[16];
+static char s_txt_resume[16];
 static char s_txt_pwm[16];
 static char s_txt_set[16];
 static char s_txt_limit[16];
@@ -120,6 +171,8 @@ static remote_link_t s_last_link;
 static const char *s_pending_toast;
 static uint32_t s_info_at;
 static uint32_t s_started_at;
+static bool s_cfg_dirty;            // 远程改的关断温度还没写 NVS
+static uint32_t s_cfg_save_at;      // 到这个时刻还没再改就落盘
 
 // 千分比格式化为 "12.3%"，整数时省略小数
 static void fmt_permille(char *buf, size_t len, uint16_t v)
@@ -155,6 +208,9 @@ static void refresh_texts(uint32_t now_ms)
 {
     control_get_status(&s_st);
     fmt_temp(s_txt_temp, sizeof(s_txt_temp), &s_st);
+    snprintf(s_txt_shut, sizeof(s_txt_shut), "%u℃", s_st.shutdown_c);
+    snprintf(s_txt_warn, sizeof(s_txt_warn), "%u℃", s_st.warn_c);
+    snprintf(s_txt_resume, sizeof(s_txt_resume), "%u℃", s_st.resume_c);
     fmt_permille(s_txt_pwm, sizeof(s_txt_pwm), s_st.pwm);
     fmt_permille(s_txt_set, sizeof(s_txt_set), s_st.setpoint);
     fmt_permille(s_txt_limit, sizeof(s_txt_limit), s_st.limit);
@@ -206,6 +262,9 @@ static const KK_UI_HomeItem home_items[] = {
 
 static const KK_UI_MenuItem settings_items[] = {
     {"温度保护", KK_UI_MENU_BOOL, BOOL_PROTECT},
+    {"关断温度", KK_UI_MENU_INT, INT_SHUTDOWN},
+    {"预警温度", KK_UI_MENU_INT, INT_WARN},
+    {"恢复温度", KK_UI_MENU_INT, INT_RESUME},
     {"软启动", KK_UI_MENU_INT, INT_SOFTSTART},
     {"调光步进", KK_UI_MENU_INT, INT_STEP},
     {"状态灯", KK_UI_MENU_BOOL, BOOL_LED},
@@ -215,6 +274,9 @@ static const KK_UI_MenuItem settings_items[] = {
 
 static const KK_UI_InfoRow status_rows[] = {
     {"温度", s_txt_temp},
+    {"关断温度", s_txt_shut},
+    {"预警温度", s_txt_warn},
+    {"恢复温度", s_txt_resume},
     {"输出", s_txt_pwm},
     {"设定", s_txt_set},
     {"上限", s_txt_limit},
@@ -257,11 +319,35 @@ static const KK_UI_InfoPage info_pages[] = {
     {"关于", about_rows, sizeof(about_rows) / sizeof(about_rows[0])},
 };
 
-static const KK_UI_IntBinding int_bindings[] = {
+// 这张表不是 const：三个温度阈值的范围要联动，运行时由 cfg_update_ranges() 重写。
+// KK_UI 每次按键都从绑定里现读 minimum/maximum（kk_ui_dialog.c 的钳位和箭头绘制），
+// 不是初始化时缓存下来的，所以改完立刻生效，`s_app` 那个 const 指针指的也是这块内存。
+static KK_UI_IntBinding int_bindings[] = {
     [INT_SOFTSTART] = {"软启动时间", &s_softstart_ms, 100, 2000, 50U, "ms", EVT_SOFTSTART_CHANGED},
     [INT_STEP] = {"调光步进", &s_step_percent, 1, 10, 1U, "%", EVT_STEP_CHANGED},
     [INT_LED_BRIGHTNESS] = {"状态灯亮度", &s_led_brightness, 5, 100, 5U, "%", EVT_LED_CHANGED},
+    // 三个温度阈值必须保持 恢复 < 预警 < 关断，范围联动，见 control.h。
+    // 这里填的绝对上下限只是初值，每次改值后都会被 cfg_update_ranges() 收窄。
+    [INT_SHUTDOWN] = {"关断温度", &s_shutdown_c, CONTROL_SHUTDOWN_C_MIN, CONTROL_SHUTDOWN_C_MAX, 1U, "℃", EVT_SHUTDOWN_CHANGED},
+    [INT_WARN] = {"预警温度", &s_warn_c, CONTROL_WARN_C_MIN, CONTROL_WARN_C_MAX, 1U, "℃", EVT_WARN_CHANGED},
+    [INT_RESUME] = {"恢复温度", &s_resume_c, CONTROL_RESUME_C_MIN, CONTROL_RESUME_C_MAX, 1U, "℃", EVT_RESUME_CHANGED},
 };
+
+/*
+ * 三档阈值的可调范围跟着另外两个的当前值走，顺序因此按不坏：
+ *   恢复  0 ~ 预警-1 ／ 预警  恢复+1 ~ 关断-1 ／ 关断  预警+1 ~ 100
+ * 每次 cfg_apply() 之后调用。正在编辑的那一项不会被自己影响（改它要按确定，
+ * 出口还是 cfg_apply），所以不会出现“编辑框里的值突然跑到范围外”。
+ */
+static void cfg_update_ranges(void)
+{
+    int_bindings[INT_RESUME].minimum = CONTROL_RESUME_C_MIN;
+    int_bindings[INT_RESUME].maximum = s_warn_c - 1;
+    int_bindings[INT_WARN].minimum = s_resume_c + 1;
+    int_bindings[INT_WARN].maximum = s_shutdown_c - 1;
+    int_bindings[INT_SHUTDOWN].minimum = s_warn_c + 1;
+    int_bindings[INT_SHUTDOWN].maximum = CONTROL_SHUTDOWN_C_MAX;
+}
 
 static const KK_UI_BoolBinding bool_bindings[] = {
     [BOOL_PROTECT] = {"温度保护", &s_protect, EVT_PROTECT_CHANGED},
@@ -337,6 +423,12 @@ static void page_led_color(KK_UI_PageId page)
     }
 }
 
+static void show_toast(const char *text)
+{
+    // 弹框打开期间 KK_UI 返回 BUSY，留到下次再显示
+    s_pending_toast = KK_UI_ShowToast(text, 0U) == KK_UI_BUSY ? text : NULL;
+}
+
 void ui_app_update(uint32_t now_ms)
 {
     KK_UI_PageId page = KK_UI_GetCurrentPage();
@@ -353,12 +445,14 @@ void ui_app_update(uint32_t now_ms)
         refresh_texts(now_ms);
         KK_UI_Invalidate();     // 差分刷新，内容未变时不产生 SPI 传输
     }
-}
 
-static void show_toast(const char *text)
-{
-    // 弹框打开期间 KK_UI 返回 BUSY，留到下次再显示
-    s_pending_toast = KK_UI_ShowToast(text, 0U) == KK_UI_BUSY ? text : NULL;
+    // 手机连点 +/- 时每档都写一次 NVS 太费 Flash，停手 2 s 再落盘
+    if (s_cfg_dirty && (int32_t)(now_ms - s_cfg_save_at) >= 0) {
+        s_cfg_dirty = false;
+        if (!cfg_save()) {
+            show_toast("保存失败");
+        }
+    }
 }
 
 static const char *fault_toast(ctrl_fault_t f)
@@ -381,6 +475,9 @@ void ui_app_process_events(void)
 
     while (KK_UI_PollEvent(&evt)) {
         switch (evt) {
+        case EVT_SHUTDOWN_CHANGED:
+        case EVT_WARN_CHANGED:
+        case EVT_RESUME_CHANGED:
         case EVT_SOFTSTART_CHANGED:
         case EVT_STEP_CHANGED:
         case EVT_LED_CHANGED:
@@ -544,7 +641,7 @@ static int16_t text_height(void)
 void KK_UI_CustomOnDraw(KK_UI_PageId page, int16_t x_offset, int16_t clip_x, uint16_t clip_width)
 {
     const ctrl_status_t *st = &s_run_shown;
-    char buf[40], buf2[24];
+    char buf[40], buf2[32];     // buf2 要放得下“降到100℃恢复输出”
     const int16_t W = (int16_t)OLED_GetWidth();
     (void)page;
 
@@ -563,7 +660,11 @@ void KK_UI_CustomOnDraw(KK_UI_PageId page, int16_t x_offset, int16_t clip_x, uin
         OLED_SetFont(ui_font_body);
         const char *l1 = st->fault == CTRL_FAULT_OVERTEMP ? "过温关断"
                        : st->fault == CTRL_FAULT_DRIVER ? "LED驱动配置失败" : "读不到温度传感器";
-        const char *l2 = st->fault == CTRL_FAULT_OVERTEMP ? "降温后按右键开启"
+        // 过温是自动恢复的，把恢复温度写出来，免得用户干等着
+        if (st->fault == CTRL_FAULT_OVERTEMP) {
+            snprintf(buf2, sizeof(buf2), "降到%u℃恢复输出", (unsigned)st->resume_c);
+        }
+        const char *l2 = st->fault == CTRL_FAULT_OVERTEMP ? buf2
                        : st->fault == CTRL_FAULT_DRIVER ? "检查LP8556与I2C" : "检查TMP102与I2C";
         OLED_DrawUTF8((int16_t)((W - OLED_GetUTF8Width(l1)) / 2 + x_offset), 22, l1);
         OLED_DrawUTF8((int16_t)((W - OLED_GetUTF8Width(l2)) / 2 + x_offset), 40, l2);
@@ -647,6 +748,20 @@ remote_result_t ui_app_remote_cmd(const remote_cmd_t *cmd, uint32_t now_ms)
             show_toast(txt);
         }
         return REMOTE_OK;
+
+    case REMOTE_CMD_TEMP:
+        // 范围已由 remote.c 把关；这里只管应用和延时落盘
+        s_shutdown_c = cmd->temp_c;
+        cfg_apply();
+        s_cfg_dirty = true;
+        s_cfg_save_at = now_ms + CFG_SAVE_DELAY_MS;
+        {
+            static char txt[24];
+            snprintf(txt, sizeof(txt), "关断温度 %u℃", (unsigned)cmd->temp_c);
+            show_toast(txt);
+        }
+        KK_UI_Invalidate();     // 设置页可能正显示这一项，刷新一下
+        return REMOTE_OK;
     }
     return REMOTE_ERR_BUSY;
 }
@@ -666,6 +781,8 @@ void ui_app_remote_status(remote_status_t *out)
         .temp_valid = st.temp_valid,
         .temp_c = st.temp_c,
         .fault = (uint8_t)st.fault,
+        .shutdown_c = st.shutdown_c,
+        .shut_min = (uint16_t)(st.warn_c + 1),
         .warn = st.warn,
         .protect = st.protect,
         .demo = st.demo,
