@@ -168,6 +168,9 @@ static ctrl_status_t s_st;
 static ctrl_fault_t s_last_fault = CTRL_FAULT_NONE;
 static bool s_last_9v;
 static remote_link_t s_last_link;
+// 有没有可用界面。false = 没装 LCD 或初始化失败：遥控仍然可用，只是不跳运行页、
+// 不弹提示。所有"必须依赖页面"的行为都要先看这个。
+static bool s_ui_ready;
 static const char *s_pending_toast;
 static uint32_t s_info_at;
 static uint32_t s_started_at;
@@ -395,11 +398,29 @@ const KK_UI_App *ui_app_get(void)
     return &s_app;
 }
 
-void ui_app_reset(uint32_t now_ms)
+/*
+ * 与屏幕无关的初始化：把 NVS 里的设置读出来并应用（温度阈值、软启动、状态灯亮度）。
+ * 没装 LCD 的板子也必须调，否则跑的还是编译期默认值——板上"/api/status"和热保护
+ * 用的就是这些值。
+ */
+void ui_app_config_init(void)
 {
     cfg_defaults();
     cfg_load();
     cfg_apply();
+}
+
+void ui_app_set_ui_ready(bool ready)
+{
+    s_ui_ready = ready;
+    if (!ready) {
+        // 没有页面可显示，状态灯按"运行页"的绿色走：板子就绪、等遥控
+        control_set_idle_color(0, 255, 0);
+    }
+}
+
+void ui_app_reset(uint32_t now_ms)
+{
     snprintf(s_txt_fw, sizeof(s_txt_fw), "%s", esp_app_get_description()->version);
     snprintf(s_txt_idf, sizeof(s_txt_idf), "%s", esp_get_idf_version());
     s_started_at = now_ms;
@@ -425,12 +446,18 @@ static void page_led_color(KK_UI_PageId page)
 
 static void show_toast(const char *text)
 {
+    if (!s_ui_ready) {
+        return;     // 没有屏幕，提示无处可弹
+    }
     // 弹框打开期间 KK_UI 返回 BUSY，留到下次再显示
     s_pending_toast = KK_UI_ShowToast(text, 0U) == KK_UI_BUSY ? text : NULL;
 }
 
 void ui_app_update(uint32_t now_ms)
 {
+    if (!s_ui_ready) {
+        return;
+    }
     KK_UI_PageId page = KK_UI_GetCurrentPage();
     page_led_color(page);
 
@@ -698,6 +725,9 @@ void KK_UI_CustomOnDraw(KK_UI_PageId page, int16_t x_offset, int16_t clip_x, uin
 // 回到首页后进入运行页；已在运行页时不动
 static bool goto_run_page(uint32_t now_ms)
 {
+    if (!s_ui_ready) {
+        return true;    // 没有界面就没有"运行页"这回事，遥控直接放行
+    }
     if (KK_UI_GetCurrentPage() == PAGE_RUN) {
         return true;
     }
@@ -760,12 +790,13 @@ remote_result_t ui_app_remote_cmd(const remote_cmd_t *cmd, uint32_t now_ms)
             snprintf(txt, sizeof(txt), "关断温度 %u℃", (unsigned)cmd->temp_c);
             show_toast(txt);
         }
-        KK_UI_Invalidate();     // 设置页可能正显示这一项，刷新一下
+        if (s_ui_ready) {
+            KK_UI_Invalidate();     // 设置页可能正显示这一项，刷新一下
+        }
         return REMOTE_OK;
     }
     return REMOTE_ERR_BUSY;
 }
-
 void ui_app_remote_status(remote_status_t *out)
 {
     ctrl_status_t st;
@@ -789,6 +820,6 @@ void ui_app_remote_status(remote_status_t *out)
         .driver = (uint8_t)st.driver,
         .timer_active = st.timer_active,
         .timer_left_s = st.timer_left_s,
-        .on_run_page = KK_UI_GetCurrentPage() == PAGE_RUN,
+        .on_run_page = s_ui_ready && KK_UI_GetCurrentPage() == PAGE_RUN,
     };
 }

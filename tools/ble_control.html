@@ -17,6 +17,7 @@
   .bar b { position:absolute; top:0; bottom:0; width:2px; background:#fff; }
   .grid { display:grid; grid-template-columns:auto 1fr; gap:6px 12px; font-size:15px; margin-top:12px; }
   .grid span:nth-child(odd) { color:var(--dim); }
+  .grid span.warn { color:var(--warn); }
   .tag { display:inline-block; padding:2px 8px; border-radius:4px; font-size:13px; background:#333; }
   .tag.run { background:var(--acc); } .tag.fault { background:var(--warn); color:#000; } .tag.ble { background:var(--blue); }
   label { display:block; color:var(--dim); font-size:14px; margin-bottom:6px; }
@@ -30,6 +31,8 @@
   .quick button { flex:1; padding:8px 0; }
   #msg { min-height:20px; font-size:14px; color:var(--warn); text-align:center; margin:8px 0; }
   .note { font-size:12px; color:var(--dim); line-height:1.5; }
+  .alarm { border:1px solid var(--warn); background:#2e1c00; color:#ffcc80; border-radius:8px;
+           padding:10px 12px; margin:0 0 12px; font-size:13px; line-height:1.5; }
   [hidden] { display:none !important; }
   #unsupported { display:none; }
   .ctl[aria-disabled=true] { opacity:.45; pointer-events:none; }
@@ -56,6 +59,9 @@
 <div id="msg"></div>
 
 <div class="ctl" id="panel" aria-disabled="true">
+<div class="alarm" id="protOff" hidden>温度保护已关闭：过温不会自动关断；这里改的关断温度也要等保护重新打开才生效。
+  到板子的“设置 → 温度保护”可以重新打开（无屏板子只能用保存过的设置）。</div>
+
 <div class="card">
   <div class="big" id="pwm">--</div>
   <div class="bar"><i id="fill" style="width:0"></i><b id="lim" style="left:100%"></b></div>
@@ -64,6 +70,7 @@
     <span>上限</span><span id="limit">--</span>
     <span>VBUS</span><span id="vbus">--</span>
     <span>温度</span><span id="temp">--</span>
+    <span>预警</span><span id="warnT">--</span>
     <span>保护</span><span id="prot">--</span>
     <span>LED驱动</span><span id="drv">--</span>
     <span>定时</span><span id="timer">--</span>
@@ -81,6 +88,7 @@
     <button data-d="50">50</button><button data-d="100">100</button>
   </div>
   <div class="row" style="margin-top:10px"><button class="primary" id="setDuty" style="flex:1">设定占空比</button></div>
+  <p class="note" style="margin:10px 0 0">超过当前上限（VBUS 5V/9V 档各有一个）会自动钳位到上限。</p>
 </div>
 
 <div class="card">
@@ -102,32 +110,46 @@
   <p class="note" style="margin:10px 0 0">可调范围 <span id="tRange">--</span>（下限跟着板上的预警温度走，
     预警调高了这里也跟着抬）。调低到当前温度以下会立刻关断；温度降下来之后会按关断前的设定值
     自己恢复输出，定时接着走。觉得板子太烫就往下调，但别调得太接近正常工作的温度。<br>
-    预警温度和恢复温度只能在板子的“设置”页里改，本页和手机 App 不提供。</p>
+    板子有三个温度阈值：恢复 &lt; 预警 &lt; 关断。本页只能改关断，预警和恢复要到板子的“设置”页改；
+    状态里的“预警”就是从板子读来的（= 关断下限 − 1），只读。</p>
 </div>
 
 <button class="stop" id="stop">停止输出</button>
 </div>
 
+<div class="card">
+  <label>固件更新（蓝牙做不了，要用热点网页）</label>
+  <p class="note" style="margin:0">蓝牙连着时板子的热点是关的，更新只能走热点：先点上面的“断开”，
+    等约 3 秒热点恢复，手机连 <code>850nm-xxxx</code> 后打开 <code>http://192.168.4.1</code>，
+    用最下面的“固件更新”卡片；电脑也可以打开 <code>tools/fw_update.html</code>，
+    把 <code>850nm_led_controller.bin</code> 拖进去。<br>
+    更新成功后让板子通电满 5 秒再断电：新固件要在这段时间里确认自己没崩，否则下次上电会自动退回旧版本。
+    0.5.0 以前的固件没有双分区和更新接口，得先用数据线烧一次。</p>
+</div>
+
 <p class="note">蓝牙连接后板子会自动关闭热点，断开约 3 秒后恢复；手机仍可正常上网。不需要在系统蓝牙设置里配对。<br>
 蓝牙未加密，附近能看到这块板子的手机都能连接，请在受控环境中使用。<br>
-850 nm 红外光肉眼几乎不可见，请勿直视发光面。设定占空比会让板子自动进入“运行”页；板上离开运行页、故障或定时到时都会立即归零。</p>
+850 nm 红外光肉眼几乎不可见，请勿直视发光面。装了屏幕的板子在设定占空比时会自动进入“运行”页；
+板上离开运行页、故障或定时到时都会立即归零。无屏固件没有运行页，设定后一直允许输出（板上按键也不参与控制）。</p>
 
 <script>
 'use strict';
-// 与固件 main/ble_link.h 一致
+// 与固件 main/ble_link.h 一致（协议版本 1，状态包固定 20 字节）
 const SVC = '9e5d0001-3c1a-4b8e-9f2d-850e0a1c0001';
 const CMD = '9e5d0002-3c1a-4b8e-9f2d-850e0a1c0001';
 const STA = '9e5d0003-3c1a-4b8e-9f2d-850e0a1c0001';
 const NAME_PREFIX = '850nm-';
+// op 1~4 与 remote.h / ble_link.h 一致；固件目前只开放这四项（其它设置只能在板上改）
 const OP = { DUTY: 1, TIMER: 2, STOP: 3, TEMP: 4 };
 // 关断阈值范围。上限是 control.h 的 CONTROL_SHUTDOWN_C_MAX（固定 100）；
 // 下限跟着板上的预警阈值走（= 预警+1），由状态包字节 [18] 的高 7 位带过来，
 // 别在这里写死：板上把预警调高，关断的下限也跟着抬高。
 // 字节 [18] 的高 7 位为 0 说明板子还是旧固件（阈值范围当时是固定的 61~100，
 // 这一字节只放了“在运行页”标志），用 LEGACY_SHUT_MIN 兜底，卡片照样显示
-// ——不能因为读不到下限就把功能藏掉。
+// ——不能因为读不到下限就把功能藏掉；这种情况下也读不出预警温度，显示“--”。
 const LEGACY_SHUT_MIN = 61;
-let SHUT_MIN = LEGACY_SHUT_MIN, SHUT_MAX = 100;
+const SHUT_MAX = 100;
+let SHUT_MIN = LEGACY_SHUT_MIN, shutMinValid = false;
 const RESULT = ['', '故障锁定或阶梯测试中，无法输出', '请先设定占空比开启输出，再开始定时', '板子忙，请重试', '参数错误'];
 const FAULT = { 1: '温度传感器故障', 2: '过温关断', 3: 'LED驱动配置失败' };
 // 过温是自动恢复的：降温后按关断前的设定值接着输出，这里说明一下
@@ -139,6 +161,7 @@ const NATIVE = window.NativeBle || null;
 const $ = id => document.getElementById(id);
 let link = 'off', linkName = '', seq = 0, lastSeq = 0, pending = null, editing = 0;
 let shut = 0, shutTouched = 0, shutTimer = 0;
+let limitPm = 1000;     // 当前占空比上限（千分比），设定时按它钳位
 
 const pct = v => (v % 10 ? (v / 10).toFixed(1) : v / 10) + '%';
 const mmss = s => { const h = Math.floor(s / 3600), m = Math.floor(s / 60) % 60, x = s % 60;
@@ -167,23 +190,28 @@ function handleStatus(d) {
   const f = d.getUint8(3);
   // 字节 [18]：bit0 = 在运行页，bits1~7 = 关断下限（板上预警阈值 + 1）。
   // 旧固件这一字节只有 0/1（没有运行页时甚至是 0），右移 7 位后是 0，用 LEGACY 兜底。
-  const shutMin = d.getUint8(18) >> 1;
+  const b18 = d.getUint8(18);
+  const shutMinRaw = b18 >> 1;
   const s = {
     seq: d.getUint8(1), res: d.getUint8(2),
-    vbusOk: f & 1, v9: f & 2, sat: f & 4, tempOk: f & 8, warn: f & 16, protect: f & 32, demo: f & 64, timerOn: f & 128,
+    vbusOk: f & 1, v9: f & 2, sat: f & 4, tempOk: f & 8, warn: f & 16, protect: !!(f & 32), demo: f & 64, timerOn: f & 128,
     pwm: d.getUint16(4, true), set: d.getUint16(6, true), limit: d.getUint16(8, true),
     mv: d.getUint16(10, true), temp: d.getInt16(12, true) / 10, left: d.getUint16(14, true),
     fault: d.getUint8(16), drv: d.getUint8(17),
     shut: d.getUint8(19),
+    runPage: b18 & 1,
     // 固件给的下限一定 ≥ 3（预警下限 2），所以 ≤ 1 就是旧固件，退回它当年的固定下限
-    shutMin: shutMin > 1 ? shutMin : LEGACY_SHUT_MIN,
+    shutMinRaw: shutMinRaw,
+    shutMin: shutMinRaw > 1 ? shutMinRaw : LEGACY_SHUT_MIN,
   };
   SHUT_MIN = s.shutMin;
+  shutMinValid = shutMinRaw > 1;
   lastSeq = s.seq;
   if (pending && s.seq === pending.seq) { pending.resolve(s.res); pending = null; }
   render(s);
 }
 function render(s) {
+  limitPm = s.limit;
   $('pwm').textContent = pct(s.pwm);
   $('fill').style.width = s.pwm / 10 + '%';
   $('lim').style.left = 'calc(' + s.limit / 10 + '% - 2px)';
@@ -191,7 +219,11 @@ function render(s) {
   $('limit').textContent = pct(s.limit);
   $('vbus').textContent = !s.vbusOk ? '--' : (s.v9 ? '9V' : '5V') + '（' + (s.sat ? '>' : '') + (s.mv / 1000).toFixed(1) + 'V）';
   $('temp').textContent = s.tempOk ? s.temp.toFixed(1) + ' ℃' : '--';
+  // 预警温度只能从关断下限反推（固件里 shut_min = 预警 + 1）
+  $('warnT').textContent = shutMinValid ? (s.shutMin - 1) + ' ℃（板上设置）' : '--';
   $('prot').textContent = !s.protect ? '已关闭' : s.fault ? (FAULT_ROW[s.fault] || FAULT[s.fault]) : (s.warn ? '温度预警' : '正常');
+  $('prot').classList.toggle('warn', !s.protect);
+  $('protOff').hidden = s.protect;     // 保护关掉时过温不关断，这不是小事，单独提示
   $('drv').textContent = DRV[s.drv] || '--';
   $('timer').textContent = s.timerOn ? '剩余 ' + mmss(s.left) : '未开启';
   const st = $('state');
@@ -211,7 +243,8 @@ function render(s) {
 
 function shutRender() {
   $('tempC').textContent = shut + ' ℃';
-  $('tRange').textContent = SHUT_MIN + ' ~ ' + SHUT_MAX;
+  $('tRange').textContent = SHUT_MIN + ' ~ ' + SHUT_MAX + ' ℃' +
+    (shutMinValid ? '（板上预警 ' + (SHUT_MIN - 1) + ' ℃）' : '');
   $('tDown').disabled = shut <= SHUT_MIN;
   $('tUp').disabled = shut >= SHUT_MAX;
 }
@@ -371,12 +404,25 @@ window.nativeBleEvent = (type, data) => {
 
 const transport = NATIVE ? nativeBle : webBle;
 
+// 上限会随 VBUS 档位变，设定前按当前上限钳位（固件也会钳，这里省得显示和实际不一致）
+const limitPct = () => Math.max(0, Math.round(limitPm / 10));
+
 $('connect').onclick = () => (link === 'on' ? transport.disconnect() : transport.connect());
 $('dutyR').oninput = () => { editing = Date.now(); $('dutyN').value = $('dutyR').value; };
 $('dutyN').oninput = () => { editing = Date.now(); $('dutyR').value = $('dutyN').value; };
 document.querySelectorAll('.quick button').forEach(b => b.onclick = () => {
-  editing = Date.now(); $('dutyR').value = $('dutyN').value = b.dataset.d; });
-$('setDuty').onclick = () => { editing = 0; send(OP.DUTY, Math.max(0, Math.min(100, +$('dutyN').value | 0)) * 10); };
+  editing = Date.now();
+  const v = Math.min(+b.dataset.d, limitPct());
+  $('dutyR').value = $('dutyN').value = v;
+});
+$('setDuty').onclick = () => {
+  editing = 0;
+  const want = Math.max(0, +$('dutyN').value | 0);
+  const v = Math.min(want, limitPct());
+  $('dutyN').value = $('dutyR').value = v;
+  if (v !== want) msg('已钳位到当前上限 ' + limitPct() + '%');
+  send(OP.DUTY, v * 10);
+};
 $('startT').onclick = () => { const m = +$('minN').value | 0;
   if (m < 1 || m > 999) { msg('定时范围 1~999 分钟'); return; } send(OP.TIMER, m); };
 $('cancelT').onclick = () => send(OP.TIMER, 0);

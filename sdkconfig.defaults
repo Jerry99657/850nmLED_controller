@@ -15,8 +15,16 @@ CONFIG_FREERTOS_HZ=1000
 # 屏幕按当前安装方式旋转 180°
 CONFIG_TFT_ROTATE_180=y
 
-# 加入 Wi-Fi 后固件超过 1 MB，使用 1500K 应用分区（NVS 偏移不变，设置保留）
-CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+# 双 OTA 分区（ota_0 / ota_1 各 1700K，无 factory）：网页在线更新固件用，见 README。
+# 这张表的 nvs 分区偏移和大小与原来的 1500K 单 app 表完全一致（0x9000 / 0x6000），
+# 所以换表不会丢设置。换表那一次必须整片烧写（idf.py flash），不能用 app-flash，
+# 因为 otadata 要由 flash 写成 0xFF（idf.py flash 会烧 ota_data_initial.bin）。
+CONFIG_PARTITION_TABLE_TWO_OTA_LARGE=y
+
+# OTA 之后新固件要在启动后自己确认一次，否则下次上电自动退回旧版本。
+# 确认点：app_main 主循环跑满 5 秒调 esp_ota_mark_app_valid_cancel_rollback()。
+# 只针对 OTA 上去的固件；用数据线烧的镜像由 bootloader 直接标 VALID，不受影响。
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # httpd 7+3 个 socket + 强制门户 DNS 1 个，默认 10 不够
 CONFIG_LWIP_MAX_SOCKETS=16

@@ -18,6 +18,8 @@
 #include "dns_server.h"
 #include "ble_link.h"
 #include "control.h"
+#include "esp_app_desc.h"
+#include "ota.h"
 
 #define CMD_TIMEOUT_MS      1000    // 主循环 5 ms 一轮，正常几毫秒内就会回复
 #define BLE_NOTIFY_MS       500
@@ -301,7 +303,7 @@ static esp_err_t h_index(httpd_req_t *req)
 static esp_err_t h_status(httpd_req_t *req)
 {
     remote_status_t st;
-    char body[384];
+    char body[512];     // 加 ver 之后留足余量，截断了页面会解析失败
 
     portENTER_CRITICAL(&s_status_lock);
     st = s_status;
@@ -318,7 +320,8 @@ static esp_err_t h_status(httpd_req_t *req)
              "\"temp\":%s,"
              "\"fault\":%u,\"warn\":%s,\"protect\":%s,\"demo\":%s,"
              "\"shut\":%u,\"shut_min\":%u,\"shut_max\":%u,"
-             "\"timer\":{\"on\":%s,\"left\":%lu},\"run_page\":%s,\"driver\":%u}",
+             "\"timer\":{\"on\":%s,\"left\":%lu},\"run_page\":%s,\"driver\":%u,"
+             "\"ver\":\"%s\",\"part\":\"%s\"}",
              st.pwm, st.setpoint, st.limit,
              st.vbus_ok ? "true" : "false", st.vbus_9v ? "true" : "false", st.vbus_mv,
              st.vbus_saturated ? "true" : "false",
@@ -327,7 +330,8 @@ static esp_err_t h_status(httpd_req_t *req)
              st.demo ? "true" : "false",
              st.shutdown_c, st.shut_min ? st.shut_min : CONTROL_SHUTDOWN_C_MIN, CONTROL_SHUTDOWN_C_MAX,
              st.timer_active ? "true" : "false", (unsigned long)st.timer_left_s,
-             st.on_run_page ? "true" : "false", st.driver);
+             st.on_run_page ? "true" : "false", st.driver,
+             esp_app_get_description()->version, ota_running_partition_label());
     return send_json(req, "200 OK", body);
 }
 
@@ -383,6 +387,8 @@ static esp_err_t http_start(void)
     httpd_handle_t server = NULL;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;   // 手机联网检测会开很多连接，满了就淘汰最旧的
+    // 默认只有 8 个，加上 /api/ota 的 POST + OPTIONS 正好用满，再想加就没位置了
+    cfg.max_uri_handlers = 12;
     // 联网检测请求很多，httpd 对无效请求的告警没有意义
     esp_log_level_set("httpd_uri", ESP_LOG_ERROR);
     esp_log_level_set("httpd_txrx", ESP_LOG_ERROR);
@@ -398,6 +404,9 @@ static esp_err_t http_start(void)
         {.uri = "/api/timer", .method = HTTP_POST, .handler = h_timer},
         {.uri = "/api/temp", .method = HTTP_POST, .handler = h_temp},
         {.uri = "/api/stop", .method = HTTP_POST, .handler = h_stop},
+        // 固件更新：POST 传 app.bin 原文，OPTIONS 是给独立更新页跨域用的预检
+        {.uri = "/api/ota", .method = HTTP_POST, .handler = ota_http_post},
+        {.uri = "/api/ota", .method = HTTP_OPTIONS, .handler = ota_http_options},
     };
     for (size_t i = 0; i < sizeof(uris) / sizeof(uris[0]); i++) {
         httpd_register_uri_handler(server, &uris[i]);
@@ -552,7 +561,11 @@ static void link_task(void *arg)
         bool ble = ble_link_connected();
         TickType_t now = xTaskGetTickCount();
         if (ble) {
-            wifi_stop();
+            // 固件正在上传时不能关热点：httpd 只有一个任务，热点一停这次上传就断了。
+            // 刷完就重启了，重启后一切照旧。
+            if (!ota_busy()) {
+                wifi_stop();
+            }
         } else {
             if (was_ble) {
                 ble_lost_at = now;

@@ -30,6 +30,7 @@
 #include "control.h"
 #include "led_pwm.h"
 #include "lp8556.h"
+#include "ota.h"
 #include "remote.h"
 #include "settings.h"
 #include "tmp102.h"
@@ -43,6 +44,9 @@
 #define TEST_PATTERN_MS     1500
 #define DISPLAY_RETRY_MS    1000
 #define REMOTE_PUBLISH_MS   100
+// OTA 上去的固件要在这段时间内证明自己没崩，否则下次上电自动退回旧版本。
+// 取 5 秒：够覆盖外设初始化和主循环头几轮，又短到不会因为随手断电而误判。
+#define OTA_CONFIRM_MS      5000
 
 static const char *TAG = "app";
 
@@ -153,6 +157,7 @@ static uint16_t i2c_scan(i2c_master_bus_handle_t bus)
 
 /* ---------- 显示 ---------- */
 
+#ifdef CONFIG_UI_ENABLE
 // 边框 + 对角线 + 尺寸文字：用于确认偏移、方向和剪切
 static void draw_test_pattern(void)
 {
@@ -191,12 +196,14 @@ static bool display_init(void)
     vTaskDelay(pdMS_TO_TICKS(TEST_PATTERN_MS));
     return true;
 }
+#endif  // CONFIG_UI_ENABLE
 
 /* ---------- 主流程 ---------- */
 
 void app_main(void)
 {
     log_boot_info();
+    ota_report_boot();      // 跑在哪个分区、OTA 后有没有回过滚，日志里能看出来
 
     // 最先把 PWM 初始化为 0%
     ESP_ERROR_CHECK(led_pwm_init());
@@ -210,8 +217,16 @@ void app_main(void)
     i2c_master_bus_handle_t bus = i2c_bus_init();
     control_init(bus, bus ? i2c_scan(bus) : 0);
 
+    // 设置与屏幕无关：读 NVS 并应用（阈值、软启动、状态灯）。没装 LCD 也要跑，
+    // 否则热保护和遥控用的还是编译期默认值。
+    ui_app_config_init();
 
+#ifdef CONFIG_UI_ENABLE
     bool ui_ok = display_init();
+#else
+    bool ui_ok = false;
+    ESP_LOGW(TAG, "UI disabled in menuconfig, running headless");
+#endif
     if (ui_ok) {
         ui_app_reset(now_ms());
         KK_UI_Status st = KK_UI_Init(ui_app_get());
@@ -220,8 +235,10 @@ void app_main(void)
             ui_ok = false;
         }
     }
+    ui_app_set_ui_ready(ui_ok);
     if (!ui_ok) {
-        ESP_LOGE(TAG, "no UI, LED_PWM stays at 0%%");
+        // 没装屏、屏坏了都走这里：不画图、不读按键菜单，其余功能照常
+        ESP_LOGW(TAG, "no LCD/UI: 只保留遥控、热保护、状态灯和 OTA，LED_PWM 上电仍为 0%%");
     }
 
 #ifdef CONFIG_REMOTE_ENABLE
@@ -243,11 +260,18 @@ void app_main(void)
     uint32_t t_beat = now_ms();
     uint32_t t_retry = 0;
     uint32_t t_publish = 0;
+    bool boot_confirmed = false;
     while (true) {
         uint32_t now = now_ms();
         uint8_t keys = ui_input_poll(now);
 
         control_update(now);
+
+        // 跑到这里说明初始化都过了、循环也在转，认下这次启动
+        if (!boot_confirmed && now >= OTA_CONFIRM_MS) {
+            boot_confirmed = true;
+            ota_confirm_boot();
+        }
 
         if (ui_ok) {
             ui_app_update(now);
@@ -261,18 +285,18 @@ void app_main(void)
                 }
             }
             ui_app_process_events();
+        }
 
-            // 手机命令只在主循环里执行，与按键、界面不会并发
-            remote_cmd_t cmd;
-            while (remote_poll(&cmd)) {
-                remote_reply(&cmd, ui_app_remote_cmd(&cmd, now));
-            }
-            if (now - t_publish >= REMOTE_PUBLISH_MS) {
-                t_publish = now;
-                remote_status_t rs;
-                ui_app_remote_status(&rs);
-                remote_publish(&rs);
-            }
+        // 手机命令和状态上报跟界面无关：没装屏也得照常收发，否则板子就没法控制了
+        remote_cmd_t cmd;
+        while (remote_poll(&cmd)) {
+            remote_reply(&cmd, ui_app_remote_cmd(&cmd, now));
+        }
+        if (now - t_publish >= REMOTE_PUBLISH_MS) {
+            t_publish = now;
+            remote_status_t rs;
+            ui_app_remote_status(&rs);
+            remote_publish(&rs);
         }
 
         if (now - t_beat >= HEARTBEAT_MS) {

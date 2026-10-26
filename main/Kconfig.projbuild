@@ -1,5 +1,18 @@
 menu "850nm LED Controller"
 
+    menu "Display / UI"
+
+        config UI_ENABLE
+            bool "Initialize the TFT and run the menu UI"
+            default y
+            help
+                关掉后不初始化屏幕、不跑 KK_UI：上电不再画 1.5 s 测试图，按键菜单也没有，
+                板子只靠 Wi-Fi / 蓝牙遥控工作（热保护、状态灯、OTA 照常）。
+                屏幕装着但初始化失败时，固件也会自动走这条无屏路径，不影响其它功能。
+                读取 NVS 设置（温度阈值、软启动、状态灯亮度）与屏幕无关，两种情况都会做。
+
+    endmenu
+
     menu "LED_PWM"
 
         config LED_PWM_FREQ_HZ

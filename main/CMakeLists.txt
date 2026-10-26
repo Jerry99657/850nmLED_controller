@@ -2,6 +2,7 @@ idf_component_register(SRCS "ble_link.c" "lp8556.c" "vbus.c" "app_main.c"
                             "control.c"
                             "settings.c"
                             "remote.c"
+                            "ota.c"
                             "led_pwm.c"
                             "tmp102.c"
                             "ws2812.c"
@@ -14,4 +15,5 @@ idf_component_register(SRCS "ble_link.c" "lp8556.c" "vbus.c" "app_main.c"
                        PRIV_REQUIRES esp_driver_ledc esp_driver_gpio esp_driver_i2c
                                      esp_driver_rmt esp_timer esp_app_format spi_flash nvs_flash esp_adc
                                      esp_wifi esp_netif esp_event esp_http_server dns_server bt
+                                     app_update
                                      kk_oled kk_ui)

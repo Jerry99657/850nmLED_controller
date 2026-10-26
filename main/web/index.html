@@ -82,6 +82,20 @@
 </div>
 
 <button class="stop" id="stop">停止输出</button>
+
+<div class="card" id="fwCard">
+  <label>固件更新（选 build/850nm_led_controller.bin，读条走完板子自动重启）</label>
+  <div class="row">
+    <input type="file" id="fwFile" accept=".bin" style="flex:1;min-width:0;font-size:14px;color:var(--dim)">
+  </div>
+  <div class="bar" style="margin-top:10px;height:14px"><i id="fwFill" style="width:0;background:var(--ok)"></i></div>
+  <div class="row" style="margin-top:10px"><button class="primary" id="fwBtn" style="flex:1">开始更新</button></div>
+  <p class="note" style="margin:10px 0 0">当前固件 <span id="fwVer">--</span>，运行在 <span id="fwPart">--</span> 分区。
+    上传过程中别关页面、别断热点；中途失败不影响使用，板子照旧跑原来的固件，重来一次就行。
+    更新成功后有 5 秒确认期，请让板子继续通电满 5 秒——这段时间断电的话，新固件会被判成没启动成功，
+    下次上电自动退回旧版本。</p>
+</div>
+
 <div id="msg"></div>
 <p class="note">850 nm 红外光肉眼几乎不可见，请勿直视发光面，以本页或板上红色状态灯判断是否在输出。设定占空比会让板子自动进入“运行”页；板上离开运行页、故障或定时到时都会立即归零。</p>
 
@@ -94,6 +108,9 @@ const FAULT = { 1: '温度传感器故障', 2: '过温关断', 3: 'LED驱动配�
 const FAULT_ROW = { 2: '过温关断，降温后恢复输出' };
 const DRV = ['无供电（仅下载口）', '配置中', '已配置 5 路', '配置失败'];
 let editing = 0;
+
+// 固件更新：上传期间停掉每秒轮询，别跟上传抢连接
+let fwBusy = false;
 
 // 过温关断阈值：本地先改显示，停手 250 ms 再发一条（连点 +/- 不会打满命令队列）
 let shut = 0, shutMin = 0, shutMax = 0, shutTouched = 0, shutTimer = 0;
@@ -113,8 +130,11 @@ async function call(path) {
 }
 
 async function poll() {
+  if (fwBusy) return;      // 上传期间别再去抢 httpd 的连接（它只有一个任务）
   try {
     const s = await (await fetch('/api/status', { cache: 'no-store' })).json();
+    $('fwVer').textContent = 'v' + (s.ver || '?');
+    $('fwPart').textContent = s.part || '?';
     $('pwm').textContent = pct(s.pwm);
     $('fill').style.width = s.pwm / 10 + '%';
     $('lim').style.left = 'calc(' + s.limit / 10 + '% - 2px)';
@@ -168,6 +188,53 @@ function shutStep(d) {
 $('tDown').onclick = () => shutStep(-1);
 $('tUp').onclick = () => shutStep(1);
 $('stop').onclick = () => { editing = 0; call('/api/stop'); };
+
+/*
+ * 固件更新。用 XHR 而不是 fetch：只有 XHR 能报上传进度（fetch 没有 upload 事件）。
+ * 板子收到完整镜像、校验通过后才回 {"ok":true}，然后自己重启。
+ * 中途失败（断线、传错文件）板子不换分区，照旧跑旧固件，重来一次就行。
+ */
+$('fwBtn').onclick = () => {
+  if (fwBusy) return;
+  const f = $('fwFile').files[0];
+  if (!f) { msg('先选一个 .bin 文件'); return; }
+  if (!/\.bin$/i.test(f.name)) { msg('请选编译出来的 850nm_led_controller.bin'); return; }
+  fwBusy = true;
+  $('fwBtn').disabled = true;
+  $('fwFill').style.width = '0';
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/ota');
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.upload.onprogress = e => {
+    if (!e.lengthComputable) return;
+    $('fwFill').style.width = (e.loaded / e.total * 100).toFixed(1) + '%';
+    msg('上传中 ' + Math.floor(e.loaded / e.total * 100) + '%（' +
+        Math.floor(e.loaded / 1024) + '/' + Math.floor(e.total / 1024) + ' KB）');
+  };
+  xhr.onload = () => {
+    let j = {}; try { j = JSON.parse(xhr.responseText); } catch (e) {}
+    if (j.ok) {
+      $('fwFill').style.width = '100%';
+      msg('更新成功（v' + (j.ver || '?') + '），板子正在重启… 请让它通电满 5 秒再断电');
+      // 重启约 3 s，多等一会儿再恢复轮询；页面重新连上后版本号会变成新的
+      setTimeout(() => { fwBusy = false; $('fwBtn').disabled = false; msg(''); poll(); }, 8000);
+    } else {
+      fwBusy = false; $('fwBtn').disabled = false;
+      // 注意括号：{}[j.err] || (...) 的 || 优先级比 + 低，不加括号错误码就丢了
+      msg(({ bad_image: '这个文件不是完好的固件镜像（或不是这块板子的芯片）',
+             not_this_board: '这是别的工程的固件，不是 850nm 控制板的',
+             bad_size: '文件大小不对', busy: '板子正在处理上一次更新，等几秒再来',
+             no_partition: '板子的分区表不支持在线更新，需要先用数据线烧一次新版本',
+             write_failed: '写入失败（板子内部错误），板子没变，重来一次' }[j.err] ||
+           ('更新失败：' + (j.err || '未知错误'))) + (j.code ? '（错误码 ' + j.code + '）' : ''));
+    }
+  };
+  xhr.onerror = () => {
+    fwBusy = false; $('fwBtn').disabled = false;
+    msg('上传中断（连接断了）。板子还在跑原来的固件，重来一次即可。');
+  };
+  xhr.send(f);
+};
 
 poll();
 setInterval(poll, 1000);

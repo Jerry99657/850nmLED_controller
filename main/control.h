@@ -26,7 +26,8 @@
  * 下面这几个只留绝对上下限：给 Kconfig 默认值和旧的 NVS 值兜底，
  * 也保证联动算出来的区间不会是空的（先钳绝对范围，顺序就总成立）。
  * 关断的实时下限不是常量，网页和手机 App 要用 remote_status_t.shut_min，
- * 别在页面里写死（tools/ble_control.html 从状态包字节 [20] 的预警值算出来）。
+ * 别在页面里写死（tools/ble_control.html 从状态包字节 [18] 的高 7 位取关断下限，
+ * 预警温度 = 下限 − 1，页面上就这么显示）。
  * 这三个值在 Kconfig 里各有一份对应的 range，改这里记得一起改。
  */
 #define CONTROL_RESUME_C_MIN    0

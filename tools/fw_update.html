@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>850nm 控制板 固件更新</title>
+<style>
+  :root { --bg:#111; --card:#1d1d1d; --fg:#eee; --dim:#999; --acc:#e53935; --ok:#43a047; --warn:#fb8c00; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:12px; font-family:system-ui,sans-serif; background:var(--bg); color:var(--fg);
+         max-width:560px; margin:0 auto; }
+  h1 { font-size:18px; margin:0 0 12px; }
+  h1 span { font-size:13px; color:var(--dim); font-weight:400; }
+  .card { background:var(--card); border-radius:10px; padding:14px; margin-bottom:12px; }
+  label { display:block; color:var(--dim); font-size:14px; margin-bottom:6px; }
+  .row { display:flex; gap:8px; align-items:center; }
+  input[type=text] { flex:1; min-width:0; font-size:15px; padding:8px; border-radius:6px;
+                     border:1px solid #444; background:#000; color:var(--fg); }
+  button { font-size:16px; padding:10px 14px; border:0; border-radius:8px; background:#333; color:var(--fg); }
+  button.primary { background:var(--ok); }
+  button:disabled { opacity:.45; }
+  #drop { border:2px dashed #444; border-radius:10px; padding:26px 14px; text-align:center;
+          color:var(--dim); cursor:pointer; font-size:15px; }
+  #drop.over { border-color:var(--ok); color:var(--fg); background:#1a2a1a; }
+  #drop b { color:var(--fg); }
+  .bar { height:14px; border-radius:7px; background:#333; position:relative; overflow:hidden; margin-top:12px; }
+  .bar i { position:absolute; left:0; top:0; bottom:0; width:0; background:var(--ok); transition:width .15s; }
+  #msg { min-height:22px; font-size:14px; color:var(--warn); }
+  #msg.ok { color:var(--ok); }
+  #msg.bad { color:var(--acc); }
+  .note { font-size:12px; color:var(--dim); line-height:1.6; }
+  code { background:#000; padding:1px 4px; border-radius:3px; font-size:12px; }
+</style>
+</head>
+<body>
+<h1>850nm 控制板 固件更新 <span>（网页在线更新，不用数据线、不用下载模式）</span></h1>
+
+<div class="card">
+  <label>板子地址</label>
+  <div class="row">
+    <input type="text" id="addr" value="http://192.168.4.1" spellcheck="false">
+    <button id="ping">测试连接</button>
+  </div>
+  <p class="note" style="margin:10px 0 0">手机或电脑先连上板子的热点
+    <code>850nm-xxxx</code>（密码 <code>850nm1234</code>，板子“关于”页上也有）。
+    板子的地址固定是 <code>192.168.4.1</code>。</p>
+</div>
+
+<div class="card">
+  <label>选择固件文件</label>
+  <div id="drop">
+    把编译出来的 <b>850nm_led_controller.bin</b> 拖到这里，或点一下选文件<br>
+    <span style="font-size:12px">在工程的 <code>build\</code> 目录下，约 1.2 MB</span>
+  </div>
+  <input type="file" id="file" accept=".bin" hidden>
+  <div class="row" style="margin-top:12px">
+    <button class="primary" id="go" style="flex:1" disabled>开始更新</button>
+    <button id="clear">清除</button>
+  </div>
+  <div class="bar"><i id="fill"></i></div>
+  <div id="msg" style="margin-top:8px"></div>
+</div>
+
+<div class="card">
+  <p class="note" style="margin:0">
+    <b style="color:var(--fg)">注意事项</b><br>
+    1. 上传过程中别关本页、别断开 Wi-Fi，也别让手机切走网络（关掉移动数据更稳）。<br>
+    2. 中途失败<b style="color:var(--fg)">不影响板子</b>：板子只有在整包收完、校验通过之后才会换固件，
+       失败就还是原来那版，重新传一次就行。<br>
+    3. 更新成功后有 5 秒确认期，请让板子继续通电满 5 秒再断电。这段时间断电的话，
+       新固件会被判成“没启动成功”，下次上电自动退回旧版本——不会变砖，但白更新一次。<br>
+    4. 传错文件（别人的固件、改坏的 bin）会被板子拒掉并提示，不会写进去。<br>
+    5. 板子重启后热点会断开几秒再回来，浏览器提示“网络无法连接”是正常的。<br>
+    6. 本页必须用<b style="color:var(--fg)">本地文件</b>或 <code>http://</code> 打开；
+       放到 https 网站上会因为“混合内容”被浏览器挡住（这一点和蓝牙控制页正好相反）。<br>
+    7. 连不上就用板子自己的页面：连上热点后浏览器打开 <code>http://192.168.4.1</code>，
+       页面最下面有同样的更新功能。
+  </p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const PART_LIMIT = 1700 * 1024;      // 板子上每个 OTA 分区的大小（sdkconfig 的双 OTA 表）
+let file = null, busy = false;
+
+// 板子地址：记住上次填的，去掉结尾的斜杠
+const base = () => $('addr').value.trim().replace(/\/+$/, '') || 'http://192.168.4.1';
+try { const a = localStorage.getItem('fwAddr'); if (a) { $('addr').value = a; } } catch (e) {}
+$('addr').onchange = () => { try { localStorage.setItem('fwAddr', base()); } catch (e) {} };
+
+// 状态提示：t 用 'ok' / 'bad' 决定颜色，看板子给的结果是成功还是失败
+function msg(t, cls) { const m = $('msg'); m.textContent = t || ''; m.className = cls || ''; }
+
+function show(f) {
+  if (!f) { file = null; $('go').disabled = true; $('drop').innerHTML =
+      '把编译出来的 <b>850nm_led_controller.bin</b> 拖到这里，或点一下选文件<br>' +
+      '<span style="font-size:12px">在工程的 <code>build\\</code> 目录下，约 1.2 MB</span>'; return; }
+  if (!/\.bin$/i.test(f.name)) { msg('请选编译出来的 850nm_led_controller.bin', 'bad'); return; }
+  if (f.size > PART_LIMIT) { msg('文件比板子的分区还大（' + Math.round(f.size / 1024) + ' KB），传不进去', 'bad'); return; }
+  if (f.size < 64 * 1024) { msg('这个文件太小了，不像是固件（' + f.size + ' 字节）', 'bad'); return; }
+  file = f;
+  msg('');
+  $('fill').style.width = '0';
+  $('drop').innerHTML = '已选择 <b>' + f.name + '</b><br><span style="font-size:12px">' +
+    Math.round(f.size / 1024) + ' KB（' + Math.round(f.size / PART_LIMIT * 100) + '% 的可用分区）</span>';
+  $('go').disabled = false;
+}
+
+$('drop').onclick = () => { if (!busy) $('file').click(); };
+$('file').onchange = () => show($('file').files[0]);
+$('clear').onclick = () => { if (busy) return; $('file').value = ''; show(null); };
+
+// 拖放：dragover 必须 preventDefault，否则浏览器会直接打开这个文件
+['dragenter', 'dragover'].forEach(t => $('drop').addEventListener(t, e => {
+  if (busy) return;
+  e.preventDefault(); $('drop').classList.add('over');
+}));
+['dragleave', 'drop'].forEach(t => $('drop').addEventListener(t, e => {
+  e.preventDefault(); $('drop').classList.remove('over');
+}));
+$('drop').addEventListener('drop', e => { if (!busy) show(e.dataTransfer.files[0]); });
+
+// 测试连接：no-cors 读不到内容，但"请求有没有被回答"就够了。
+// 能走到 then 说明板子在（哪怕是 404），连不上会 reject。
+$('ping').onclick = async () => {
+  $('ping').disabled = true;
+  msg('正在连 ' + base() + ' …');
+  try {
+    await fetch(base() + '/api/status', { mode: 'no-cors', cache: 'no-store' });
+    msg('能连上板子，可以开始更新', 'ok');
+  } catch (e) {
+    msg('连不上。检查：1) 手机/电脑是否连着板子热点 850nm-xxxx；2) 地址是不是 192.168.4.1', 'bad');
+  }
+  $('ping').disabled = false;
+};
+
+$('go').onclick = () => {
+  if (busy || !file) return;
+  busy = true;
+  $('go').disabled = true; $('ping').disabled = true; $('clear').disabled = true;
+  $('fill').style.width = '0';
+  msg('正在上传…');
+
+  const t0 = Date.now();
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', base() + '/api/ota');
+  xhr.timeout = 0;      // 大文件上传期间不设总超时，靠进度条判断
+  // 用 application/octet-stream 会先触发一次跨域预检（OPTIONS），板子实现了
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+
+  xhr.upload.onprogress = e => {
+    if (!e.lengthComputable) return;
+    const p = e.loaded / e.total, sec = (Date.now() - t0) / 1000;
+    const speed = sec > 0.3 ? e.loaded / sec / 1024 : 0;
+    $('fill').style.width = (p * 100).toFixed(1) + '%';
+    msg('上传中 ' + Math.floor(p * 100) + '%（' + Math.round(e.loaded / 1024) + '/' +
+        Math.round(e.total / 1024) + ' KB' + (speed > 8 ? '，' + Math.round(speed) + ' KB/s' : '') + '）');
+  };
+
+  xhr.onload = () => {
+    let j = {}; try { j = JSON.parse(xhr.responseText); } catch (e) {}
+    busy = false; $('go').disabled = false; $('ping').disabled = false; $('clear').disabled = false;
+    if (j.ok) {
+      $('fill').style.width = '100%';
+      msg('更新成功，板子里现在是 v' + (j.ver || '?') + '（写在 ' + (j.part || 'OTA') +
+          ' 分区），正在重启… 约 10 秒后热点会回来。请让板子继续通电满 5 秒再断电，' +
+          '这段时间断电会被判成没启动成功、下次上电自动退回旧版本。', 'ok');
+    } else {
+      msg('更新失败：' + ({ bad_image: '这个文件不是完好的固件镜像（或芯片型号不对）',
+        not_this_board: '这是别的工程的固件，不是 850nm 控制板的',
+        bad_size: '文件大小不对', busy: '板子正在处理上一次更新，等几秒再试',
+        no_partition: '板子的分区表还不支持在线更新，需要先用数据线烧一次新版本',
+        write_failed: '写入失败（板子内部错误）' }[j.err] ||
+        (j.err || '未知错误')) + (j.code ? '，错误码 ' + j.code : '') +
+        '。板子没变，还是原来那一版。', 'bad');
+    }
+  };
+  xhr.onerror = () => {
+    busy = false; $('go').disabled = false; $('ping').disabled = false; $('clear').disabled = false;
+    msg('上传中断（连接断了）。板子还在跑原来的固件，重来一次即可。', 'bad');
+  };
+  xhr.send(file);
+};
+
+// 上传期间误关页面挺浪费的，拦一下
+window.addEventListener('beforeunload', e => {
+  if (busy) { e.preventDefault(); e.returnValue = ''; }
+});
+</script>
+</body>
+</html>

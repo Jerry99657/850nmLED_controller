@@ -21,8 +21,8 @@ import subprocess
 import sys
 import zipfile
 
-VERSION_NAME = "0.3.2"
-VERSION_CODE = 5
+VERSION_NAME = "0.3.3"
+VERSION_CODE = 6
 MIN_SDK = 26        # Android 8.0
 TARGET_SDK = 34
 
